@@ -8,6 +8,7 @@ import os
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+from typing import Optional
 
 load_dotenv()
 
@@ -38,10 +39,20 @@ class TagInput(BaseModel):
     nama_tag: str
     sumber: str
 
+class FolderInput(BaseModel):
+    nama: str
+    parent_id: Optional[str] = None
+    user_id: str
+
+class RuleInput(BaseModel):
+    user_id: str
+    keyword: str
+    folder_id: str
+
 # ── Helper: auto tagging ─────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
     stopwords = {"the","and","for","with","dari","dan","untuk","dengan","di","ke","yang","at","in","on"}
-    nama  = os.path.splitext(nama_file)[0]
+    nama   = os.path.splitext(nama_file)[0]
     tokens = nama.replace("-", "_").replace(" ", "_").split("_")
     return [t.lower() for t in tokens if t and t.lower() not in stopwords and len(t) > 1]
 
@@ -49,20 +60,14 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
     tags = []
     if "image" in tipe:
         tags.append("gambar")
-        if "jpeg" in tipe or "jpg" in tipe:
-            tags.append("jpg")
-        elif "png" in tipe:
-            tags.append("png")
-        elif "gif" in tipe:
-            tags.append("gif")
-        elif "webp" in tipe:
-            tags.append("webp")
+        if "jpeg" in tipe or "jpg" in tipe: tags.append("jpg")
+        elif "png" in tipe:  tags.append("png")
+        elif "gif" in tipe:  tags.append("gif")
+        elif "webp" in tipe: tags.append("webp")
     elif "video" in tipe:
         tags.append("video")
-        if "mp4" in tipe:
-            tags.append("mp4")
-        elif "quicktime" in tipe:
-            tags.append("mov")
+        if "mp4" in tipe:       tags.append("mp4")
+        elif "quicktime" in tipe: tags.append("mov")
     elif "pdf" in tipe:
         tags.append("pdf")
         tags.append("dokumen")
@@ -74,28 +79,19 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
         tags.append("spreadsheet")
 
     mb = ukuran / (1024 * 1024)
-    if mb < 1:
-        tags.append("file-kecil")
-    elif mb < 10:
-        tags.append("file-sedang")
-    else:
-        tags.append("file-besar")
+    if mb < 1:    tags.append("file-kecil")
+    elif mb < 10: tags.append("file-sedang")
+    else:         tags.append("file-besar")
 
     return tags
 
 def tag_dari_imagga(url_gambar: str) -> list:
     tags = []
 
-    # Tags utama — limit 25, threshold 25
     try:
         response = requests.get(
             "https://api.imagga.com/v2/tags",
-            params={
-                "image_url": url_gambar,
-                "limit": 25,
-                "threshold": 25,
-                "language": "en"
-            },
+            params={"image_url": url_gambar, "limit": 25, "threshold": 25, "language": "en"},
             auth=HTTPBasicAuth(IMAGGA_KEY, IMAGGA_SECRET),
             timeout=15
         )
@@ -109,7 +105,6 @@ def tag_dari_imagga(url_gambar: str) -> list:
     except Exception as e:
         print(f"Imagga tags error: {e}")
 
-    # Warna dominan
     try:
         response = requests.get(
             "https://api.imagga.com/v2/colors",
@@ -122,7 +117,7 @@ def tag_dari_imagga(url_gambar: str) -> list:
             colors = result["result"]["colors"]
             for c in colors.get("image_colors", [])[:3]:
                 nama_warna = c["closest_palette_color"].lower().replace(" ", "-")
-                if nama_warna not in tags:
+                if f"warna-{nama_warna}" not in tags:
                     tags.append(f"warna-{nama_warna}")
             for c in colors.get("foreground_colors", [])[:2]:
                 nama_warna = c["closest_palette_color"].lower().replace(" ", "-")
@@ -132,7 +127,6 @@ def tag_dari_imagga(url_gambar: str) -> list:
     except Exception as e:
         print(f"Imagga colors error: {e}")
 
-    # Kategori
     try:
         response = requests.get(
             "https://api.imagga.com/v2/categories/personal_photos",
@@ -145,7 +139,7 @@ def tag_dari_imagga(url_gambar: str) -> list:
             for cat in result["result"]["categories"]:
                 if cat["confidence"] >= 20:
                     nama_cat = cat["name"]["en"].lower().replace(" ", "-")
-                    if nama_cat not in tags:
+                    if f"kategori-{nama_cat}" not in tags:
                         tags.append(f"kategori-{nama_cat}")
     except Exception as e:
         print(f"Imagga categories error: {e}")
@@ -168,6 +162,22 @@ def simpan_tags(asset_id: str, tags: list, sumber: str):
             "tag_id":   tag_id,
             "sumber":   sumber
         }).execute()
+
+def auto_assign_folder(asset_id: str, user_id: str, tags: list):
+    rules = supabase.table("folder_rules").select("*, folders(nama)").eq("user_id", user_id).execute()
+    if not rules.data:
+        return
+    for rule in rules.data:
+        keyword = rule["keyword"].lower()
+        for tag in tags:
+            if keyword in tag.lower():
+                already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", rule["folder_id"]).execute()
+                if not already.data:
+                    supabase.table("asset_folders").insert({
+                        "asset_id": asset_id,
+                        "folder_id": rule["folder_id"]
+                    }).execute()
+                break
 
 # ── Endpoints ────────────────────────────────────────
 
@@ -243,12 +253,13 @@ async def upload_asset(
         tags_ai = tag_dari_imagga(url_publik)
         simpan_tags(asset_id, tags_ai, "ai")
 
-    tags_semua = list(set(tags_nama + tags_tipe + tags_ai))
+    semua_tags = tags_nama + tags_tipe + tags_ai
+    auto_assign_folder(asset_id, user_id, semua_tags)
 
     return {
         "message": "Upload berhasil",
         "asset":   result.data[0],
-        "tags":    tags_semua,
+        "tags":    list(set(semua_tags)),
         "tags_ai": tags_ai
     }
 
@@ -275,6 +286,7 @@ def delete_asset(asset_id: str):
     path = url.split("/object/public/assets/")[1]
     supabase.storage.from_("assets").remove([path])
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).execute()
+    supabase.table("asset_folders").delete().eq("asset_id", asset_id).execute()
     supabase.table("assets").delete().eq("id", asset_id).execute()
     return {"message": "Aset berhasil dihapus"}
 
@@ -333,6 +345,20 @@ def count_tags(user_id: str):
     unique_tags = set(at["tag_id"] for at in result.data)
     return {"count": len(unique_tags)}
 
+@app.get("/tags/top")
+def top_tags(user_id: str, limit: int = 7):
+    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+    asset_ids = [a["id"] for a in assets.data]
+    if not asset_ids:
+        return {"tags": []}
+    result = supabase.table("asset_tags").select("tag_id, tags(nama)").in_("asset_id", asset_ids).execute()
+    count = {}
+    for item in result.data:
+        nama = item["tags"]["nama"]
+        count[nama] = count.get(nama, 0) + 1
+    sorted_tags = sorted(count.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return {"tags": [{"nama": t[0], "jumlah": t[1]} for t in sorted_tags]}
+
 # Search
 @app.get("/search/by-tag")
 def get_assets_by_tag(user_id: str, tag: str):
@@ -371,16 +397,48 @@ def stats_tagging(user_id: str):
         "pct_manual":    round(manual    / total * 100) if total else 0,
     }
 
-@app.get("/tags/top")
-def top_tags(user_id: str, limit: int = 7):
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
-    asset_ids = [a["id"] for a in assets.data]
-    if not asset_ids:
-        return {"tags": []}
-    result = supabase.table("asset_tags").select("tag_id, tags(nama)").in_("asset_id", asset_ids).execute()
-    count = {}
-    for item in result.data:
-        nama = item["tags"]["nama"]
-        count[nama] = count.get(nama, 0) + 1
-    sorted_tags = sorted(count.items(), key=lambda x: x[1], reverse=True)[:limit]
-    return {"tags": [{"nama": t[0], "jumlah": t[1]} for t in sorted_tags]}
+# Folders
+@app.post("/folders")
+def buat_folder(data: FolderInput):
+    payload = {"nama": data.nama, "user_id": data.user_id}
+    if data.parent_id:
+        payload["parent_id"] = data.parent_id
+    result = supabase.table("folders").insert(payload).execute()
+    return {"message": "Folder dibuat", "folder": result.data[0]}
+
+@app.get("/folders")
+def get_folders(user_id: str):
+    result = supabase.table("folders").select("*").eq("user_id", user_id).order("nama").execute()
+    return {"folders": result.data}
+
+@app.delete("/folders/{folder_id}")
+def hapus_folder(folder_id: str):
+    supabase.table("asset_folders").delete().eq("folder_id", folder_id).execute()
+    supabase.table("folder_rules").delete().eq("folder_id", folder_id).execute()
+    supabase.table("folders").delete().eq("id", folder_id).execute()
+    return {"message": "Folder dihapus"}
+
+@app.post("/folders/rules")
+def buat_rule(data: RuleInput):
+    result = supabase.table("folder_rules").insert({
+        "user_id":   data.user_id,
+        "keyword":   data.keyword.lower(),
+        "folder_id": data.folder_id
+    }).execute()
+    return {"message": "Rule ditambahkan", "rule": result.data[0]}
+
+@app.get("/folders/rules")
+def get_rules(user_id: str):
+    result = supabase.table("folder_rules").select("*, folders(nama)").eq("user_id", user_id).execute()
+    return {"rules": result.data}
+
+@app.delete("/folders/rules/{rule_id}")
+def hapus_rule(rule_id: str):
+    supabase.table("folder_rules").delete().eq("id", rule_id).execute()
+    return {"message": "Rule dihapus"}
+
+@app.get("/folders/{folder_id}/assets")
+def get_assets_by_folder(folder_id: str):
+    result = supabase.table("asset_folders").select("asset_id, assets(*)").eq("folder_id", folder_id).execute()
+    assets = [r["assets"] for r in result.data if r["assets"]]
+    return {"assets": assets}
