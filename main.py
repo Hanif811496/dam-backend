@@ -49,6 +49,16 @@ class RuleInput(BaseModel):
     keyword: str
     folder_id: str
 
+class ShareInput(BaseModel):
+    asset_id: str
+    from_user_id: str
+    to_division_id: str
+    catatan: Optional[str] = None
+
+class PermissionInput(BaseModel):
+    asset_id: str
+    division_ids: list
+
 # ── Helper: auto tagging ─────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
     stopwords = {"the","and","for","with","dari","dan","untuk","dengan","di","ke","yang","at","in","on"}
@@ -179,6 +189,55 @@ def auto_assign_folder(asset_id: str, user_id: str, tags: list):
                     }).execute()
                 break
 
+# ── Division Config ───────────────────────────────────
+MANAGER_ID     = "79732e94-d800-4b11-ad92-74e594f1b54b"
+
+DIVISION_ACCESS = {
+    "79732e94-d800-4b11-ad92-74e594f1b54b": ["*"],
+    "1e070a54-a821-4387-ae8d-db89940b3eb4": ["image"],
+    "48bf0df6-6a0d-479c-8cae-cd05061ee344": ["image", "blend", "obj", "fbx", "stl"],
+    "f3dbaed9-2449-40d8-98a6-17ac595aa297": ["blend", "obj", "fbx", "mp3", "wav", "m4a"],
+    "14a99fdd-700a-439b-81f7-e6f4092ce07c": ["video", "mp3", "wav", "pdf", "docx"],
+    "7610a2fa-9e2b-4030-9009-17f4ab102ece": ["blend", "obj", "fbx", "video", "image"],
+    "6ae919bc-47d0-4703-844d-91438bdcc14f": ["*"],
+}
+
+# ── Helpers Divisi ────────────────────────────────────
+def get_user_division(user_id: str):
+    result = supabase.table("user_divisions").select("*, divisions(*)").eq("user_id", user_id).execute()
+    if not result.data:
+        return None
+    return result.data[0]
+
+def is_manager(user_id: str) -> bool:
+    ud = get_user_division(user_id)
+    if not ud:
+        return False
+    return ud["division_id"] == MANAGER_ID
+
+def can_access_asset(user_id: str, asset_id: str) -> bool:
+    ud = get_user_division(user_id)
+    if not ud:
+        return False
+    division_id = ud["division_id"]
+
+    if division_id == MANAGER_ID:
+        return True
+
+    asset = supabase.table("assets").select("is_public").eq("id", asset_id).execute()
+    if not asset.data:
+        return False
+    if asset.data[0].get("is_public", True):
+        return True
+
+    perms = supabase.table("asset_permissions").select("division_id").eq("asset_id", asset_id).execute()
+    allowed = [p["division_id"] for p in perms.data]
+    if division_id in allowed:
+        return True
+
+    shares = supabase.table("asset_shares").select("id").eq("asset_id", asset_id).eq("to_division_id", division_id).execute()
+    return len(shares.data) > 0
+
 # ── Endpoints ────────────────────────────────────────
 
 @app.get("/")
@@ -209,7 +268,25 @@ def login(data: LoginInput):
         raise HTTPException(status_code=400, detail="Email atau password salah")
     return {"message": "Login berhasil", "user_id": user["id"], "nama": user["nama"]}
 
-# Assets
+@app.post("/auth/register-with-division")
+def register_with_division(data: RegisterInput, division_id: str):
+    existing = supabase.table("users").select("id").eq("email", data.email).execute()
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Email sudah terdaftar")
+    hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt()).decode()
+    result = supabase.table("users").insert({
+        "nama":     data.nama,
+        "email":    data.email,
+        "password": hashed
+    }).execute()
+    user_id = result.data[0]["id"]
+    supabase.table("user_divisions").insert({
+        "user_id":     user_id,
+        "division_id": division_id
+    }).execute()
+    return {"message": "Registrasi berhasil", "user": result.data[0]}
+
+# Assets — urutan penting: route spesifik SEBELUM route dengan path param
 @app.post("/assets/upload")
 async def upload_asset(
     user_id: str = Form(...),
@@ -267,6 +344,100 @@ async def upload_asset(
 def get_assets(user_id: str):
     result = supabase.table("assets").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
     return {"assets": result.data}
+
+@app.get("/assets/by-division")
+def get_assets_by_division(user_id: str):
+    ud = get_user_division(user_id)
+    if not ud:
+        return {"assets": []}
+
+    division_id = ud["division_id"]
+
+    if division_id == MANAGER_ID:
+        result = supabase.table("assets").select("*").order("created_at", desc=True).execute()
+        return {"assets": result.data}
+
+    public_assets = supabase.table("assets").select("*").eq("is_public", True).order("created_at", desc=True).execute()
+
+    perm_result = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
+    perm_asset_ids = [p["asset_id"] for p in perm_result.data]
+
+    share_result = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
+    share_asset_ids = [s["asset_id"] for s in share_result.data]
+
+    all_ids = set(perm_asset_ids + share_asset_ids)
+    private_assets = []
+    if all_ids:
+        private_result = supabase.table("assets").select("*").in_("id", list(all_ids)).eq("is_public", False).execute()
+        private_assets = private_result.data
+
+    all_assets = {a["id"]: a for a in public_assets.data}
+    for a in private_assets:
+        all_assets[a["id"]] = a
+
+    return {"assets": list(all_assets.values())}
+
+@app.get("/assets/shared-to-me")
+def get_shared_to_me(user_id: str):
+    ud = get_user_division(user_id)
+    if not ud:
+        return {"shares": []}
+    division_id = ud["division_id"]
+    result = supabase.table("asset_shares").select(
+        "*, assets(*), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
+    ).eq("to_division_id", division_id).order("created_at", desc=True).execute()
+    return {"shares": result.data}
+
+@app.get("/assets/shared-by-me")
+def get_shared_by_me(user_id: str):
+    result = supabase.table("asset_shares").select(
+        "*, assets(*), divisions(nama)"
+    ).eq("from_user_id", user_id).order("created_at", desc=True).execute()
+    return {"shares": result.data}
+
+@app.get("/assets/unread-shares")
+def get_unread_shares(user_id: str):
+    ud = get_user_division(user_id)
+    if not ud:
+        return {"count": 0}
+    division_id = ud["division_id"]
+    result = supabase.table("asset_shares").select("id").eq("to_division_id", division_id).eq("is_read", False).execute()
+    return {"count": len(result.data)}
+
+@app.post("/assets/share")
+def share_asset(data: ShareInput):
+    result = supabase.table("asset_shares").insert({
+        "asset_id":      data.asset_id,
+        "from_user_id":  data.from_user_id,
+        "to_division_id": data.to_division_id,
+        "catatan":       data.catatan,
+        "is_read":       False
+    }).execute()
+    return {"message": "Aset berhasil dibagikan", "share": result.data[0]}
+
+@app.put("/assets/share/{share_id}/read")
+def mark_share_read(share_id: str):
+    supabase.table("asset_shares").update({"is_read": True}).eq("id", share_id).execute()
+    return {"message": "Ditandai sudah dibaca"}
+
+@app.post("/assets/permissions")
+def set_permissions(data: PermissionInput):
+    supabase.table("asset_permissions").delete().eq("asset_id", data.asset_id).execute()
+    if not data.division_ids:
+        supabase.table("assets").update({"is_public": True}).eq("id", data.asset_id).execute()
+        return {"message": "Aset dijadikan publik"}
+    supabase.table("assets").update({"is_public": False}).eq("id", data.asset_id).execute()
+    for div_id in data.division_ids:
+        supabase.table("asset_permissions").insert({
+            "asset_id": data.asset_id,
+            "division_id": div_id
+        }).execute()
+    return {"message": "Permission diset"}
+
+@app.get("/assets/permissions/{asset_id}")
+def get_permissions(asset_id: str):
+    result = supabase.table("asset_permissions").select("*, divisions(nama)").eq("asset_id", asset_id).execute()
+    return {"permissions": result.data}
 
 @app.get("/assets/{asset_id}")
 def get_asset_detail(asset_id: str):
@@ -443,67 +614,7 @@ def get_assets_by_folder(folder_id: str):
     assets = [r["assets"] for r in result.data if r["assets"]]
     return {"assets": assets}
 
-# ── Division Config ───────────────────────────────────
-MANAGER_ID     = "79732e94-d800-4b11-ad92-74e594f1b54b"
-
-DIVISION_ACCESS = {
-    "79732e94-d800-4b11-ad92-74e594f1b54b": ["*"],  # Manager — semua
-    "1e070a54-a821-4387-ae8d-db89940b3eb4": ["image"],  # Design Artist
-    "48bf0df6-6a0d-479c-8cae-cd05061ee344": ["image", "blend", "obj", "fbx", "stl"],  # 3D Modeler
-    "f3dbaed9-2449-40d8-98a6-17ac595aa297": ["blend", "obj", "fbx", "mp3", "wav", "m4a"],  # Animator
-    "14a99fdd-700a-439b-81f7-e6f4092ce07c": ["video", "mp3", "wav", "pdf", "docx"],  # Editor
-    "7610a2fa-9e2b-4030-9009-17f4ab102ece": ["blend", "obj", "fbx", "video", "image"],  # Render Artist
-    "6ae919bc-47d0-4703-844d-91438bdcc14f": ["*"],  # Custom — dikonfigurasi manual
-}
-
-# ── Models Tambahan ───────────────────────────────────
-class ShareInput(BaseModel):
-    asset_id: str
-    from_user_id: str
-    to_division_id: str
-    catatan: Optional[str] = None
-
-class PermissionInput(BaseModel):
-    asset_id: str
-    division_ids: list
-
-# ── Helpers Divisi ────────────────────────────────────
-def get_user_division(user_id: str):
-    result = supabase.table("user_divisions").select("*, divisions(*)").eq("user_id", user_id).execute()
-    if not result.data:
-        return None
-    return result.data[0]
-
-def is_manager(user_id: str) -> bool:
-    ud = get_user_division(user_id)
-    if not ud:
-        return False
-    return ud["division_id"] == MANAGER_ID
-
-def can_access_asset(user_id: str, asset_id: str) -> bool:
-    ud = get_user_division(user_id)
-    if not ud:
-        return False
-    division_id = ud["division_id"]
-
-    if division_id == MANAGER_ID:
-        return True
-
-    asset = supabase.table("assets").select("is_public").eq("id", asset_id).execute()
-    if not asset.data:
-        return False
-    if asset.data[0].get("is_public", True):
-        return True
-
-    perms = supabase.table("asset_permissions").select("division_id").eq("asset_id", asset_id).execute()
-    allowed = [p["division_id"] for p in perms.data]
-    if division_id in allowed:
-        return True
-
-    shares = supabase.table("asset_shares").select("id").eq("asset_id", asset_id).eq("to_division_id", division_id).execute()
-    return len(shares.data) > 0
-
-# ── Endpoints Divisi ──────────────────────────────────
+# Divisions
 @app.get("/divisions")
 def get_divisions():
     result = supabase.table("divisions").select("*").order("nama").execute()
@@ -534,119 +645,3 @@ def get_all_users_with_division():
         division = ud.data[0] if ud.data else None
         result.append({**u, "division": division})
     return {"users": result}
-
-# ── Endpoints Permission ──────────────────────────────
-@app.post("/assets/permissions")
-def set_permissions(data: PermissionInput):
-    supabase.table("asset_permissions").delete().eq("asset_id", data.asset_id).execute()
-    if not data.division_ids:
-        supabase.table("assets").update({"is_public": True}).eq("id", data.asset_id).execute()
-        return {"message": "Aset dijadikan publik"}
-    supabase.table("assets").update({"is_public": False}).eq("id", data.asset_id).execute()
-    for div_id in data.division_ids:
-        supabase.table("asset_permissions").insert({
-            "asset_id": data.asset_id,
-            "division_id": div_id
-        }).execute()
-    return {"message": "Permission diset"}
-
-@app.get("/assets/permissions/{asset_id}")
-def get_permissions(asset_id: str):
-    result = supabase.table("asset_permissions").select("*, divisions(nama)").eq("asset_id", asset_id).execute()
-    return {"permissions": result.data}
-
-# ── Endpoints Sharing ─────────────────────────────────
-@app.post("/assets/share")
-def share_asset(data: ShareInput):
-    result = supabase.table("asset_shares").insert({
-        "asset_id":      data.asset_id,
-        "from_user_id":  data.from_user_id,
-        "to_division_id": data.to_division_id,
-        "catatan":       data.catatan,
-        "is_read":       False
-    }).execute()
-    return {"message": "Aset berhasil dibagikan", "share": result.data[0]}
-
-@app.get("/assets/shared-to-me")
-def get_shared_to_me(user_id: str):
-    ud = get_user_division(user_id)
-    if not ud:
-        return {"shares": []}
-    division_id = ud["division_id"]
-    result = supabase.table("asset_shares").select(
-        "*, assets(*), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
-    ).eq("to_division_id", division_id).order("created_at", desc=True).execute()
-    return {"shares": result.data}
-
-@app.get("/assets/shared-by-me")
-def get_shared_by_me(user_id: str):
-    result = supabase.table("asset_shares").select(
-        "*, assets(*), divisions(nama)"
-    ).eq("from_user_id", user_id).order("created_at", desc=True).execute()
-    return {"shares": result.data}
-
-@app.put("/assets/share/{share_id}/read")
-def mark_share_read(share_id: str):
-    supabase.table("asset_shares").update({"is_read": True}).eq("id", share_id).execute()
-    return {"message": "Ditandai sudah dibaca"}
-
-@app.get("/assets/unread-shares")
-def get_unread_shares(user_id: str):
-    ud = get_user_division(user_id)
-    if not ud:
-        return {"count": 0}
-    division_id = ud["division_id"]
-    result = supabase.table("asset_shares").select("id").eq("to_division_id", division_id).eq("is_read", False).execute()
-    return {"count": len(result.data)}
-
-# ── Update endpoint register dengan divisi ────────────
-@app.post("/auth/register-with-division")
-def register_with_division(data: RegisterInput, division_id: str):
-    existing = supabase.table("users").select("id").eq("email", data.email).execute()
-    if existing.data:
-        raise HTTPException(status_code=400, detail="Email sudah terdaftar")
-    hashed = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt()).decode()
-    result = supabase.table("users").insert({
-        "nama":     data.nama,
-        "email":    data.email,
-        "password": hashed
-    }).execute()
-    user_id = result.data[0]["id"]
-    supabase.table("user_divisions").insert({
-        "user_id":     user_id,
-        "division_id": division_id
-    }).execute()
-    return {"message": "Registrasi berhasil", "user": result.data[0]}
-
-# ── Admin: assets dengan filter divisi ───────────────
-@app.get("/assets/by-division")
-def get_assets_by_division(user_id: str):
-    ud = get_user_division(user_id)
-    if not ud:
-        return {"assets": []}
-
-    division_id = ud["division_id"]
-
-    if division_id == MANAGER_ID:
-        result = supabase.table("assets").select("*").order("created_at", desc=True).execute()
-        return {"assets": result.data}
-
-    public_assets = supabase.table("assets").select("*").eq("is_public", True).order("created_at", desc=True).execute()
-
-    perm_result = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
-    perm_asset_ids = [p["asset_id"] for p in perm_result.data]
-
-    share_result = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
-    share_asset_ids = [s["asset_id"] for s in share_result.data]
-
-    all_ids = set(perm_asset_ids + share_asset_ids)
-    private_assets = []
-    if all_ids:
-        private_result = supabase.table("assets").select("*").in_("id", list(all_ids)).eq("is_public", False).execute()
-        private_assets = private_result.data
-
-    all_assets = {a["id"]: a for a in public_assets.data}
-    for a in private_assets:
-        all_assets[a["id"]] = a
-
-    return {"assets": list(all_assets.values())}
