@@ -645,3 +645,31 @@ def get_all_users_with_division():
         division = ud.data[0] if ud.data else None
         result.append({**u, "division": division})
     return {"users": result}
+
+# Admin
+@app.delete("/admin/users/{user_id}")
+def hapus_user(user_id: str):
+    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+    asset_ids = [a["id"] for a in assets.data]
+
+    if asset_ids:
+        supabase.table("asset_tags").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_folders").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_permissions").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_shares").delete().in_("asset_id", asset_ids).execute()
+        for a in assets.data:
+            try:
+                url  = a.get("url", "")
+                if "/object/public/assets/" in url:
+                    path = url.split("/object/public/assets/")[1]
+                    supabase.storage.from_("assets").remove([path])
+            except:
+                pass
+        supabase.table("assets").delete().eq("user_id", user_id).execute()
+
+    supabase.table("folder_rules").delete().eq("user_id", user_id).execute()
+    supabase.table("folders").delete().eq("user_id", user_id).execute()
+    supabase.table("user_divisions").delete().eq("user_id", user_id).execute()
+    supabase.table("users").delete().eq("id", user_id).execute()
+
+    return {"message": "Akun berhasil dihapus"}
