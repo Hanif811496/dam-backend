@@ -76,7 +76,7 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
         elif "webp" in tipe: tags.append("webp")
     elif "video" in tipe:
         tags.append("video")
-        if "mp4" in tipe:       tags.append("mp4")
+        if "mp4" in tipe:         tags.append("mp4")
         elif "quicktime" in tipe: tags.append("mov")
     elif "pdf" in tipe:
         tags.append("pdf")
@@ -184,23 +184,13 @@ def auto_assign_folder(asset_id: str, user_id: str, tags: list):
                 already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", rule["folder_id"]).execute()
                 if not already.data:
                     supabase.table("asset_folders").insert({
-                        "asset_id": asset_id,
+                        "asset_id":  asset_id,
                         "folder_id": rule["folder_id"]
                     }).execute()
                 break
 
 # ── Division Config ───────────────────────────────────
-MANAGER_ID     = "79732e94-d800-4b11-ad92-74e594f1b54b"
-
-DIVISION_ACCESS = {
-    "79732e94-d800-4b11-ad92-74e594f1b54b": ["*"],
-    "1e070a54-a821-4387-ae8d-db89940b3eb4": ["image"],
-    "48bf0df6-6a0d-479c-8cae-cd05061ee344": ["image", "blend", "obj", "fbx", "stl"],
-    "f3dbaed9-2449-40d8-98a6-17ac595aa297": ["blend", "obj", "fbx", "mp3", "wav", "m4a"],
-    "14a99fdd-700a-439b-81f7-e6f4092ce07c": ["video", "mp3", "wav", "pdf", "docx"],
-    "7610a2fa-9e2b-4030-9009-17f4ab102ece": ["blend", "obj", "fbx", "video", "image"],
-    "6ae919bc-47d0-4703-844d-91438bdcc14f": ["*"],
-}
+MANAGER_ID = "79732e94-d800-4b11-ad92-74e594f1b54b"
 
 # ── Helpers Divisi ────────────────────────────────────
 def get_user_division(user_id: str):
@@ -214,29 +204,6 @@ def is_manager(user_id: str) -> bool:
     if not ud:
         return False
     return ud["division_id"] == MANAGER_ID
-
-def can_access_asset(user_id: str, asset_id: str) -> bool:
-    ud = get_user_division(user_id)
-    if not ud:
-        return False
-    division_id = ud["division_id"]
-
-    if division_id == MANAGER_ID:
-        return True
-
-    asset = supabase.table("assets").select("is_public").eq("id", asset_id).execute()
-    if not asset.data:
-        return False
-    if asset.data[0].get("is_public", True):
-        return True
-
-    perms = supabase.table("asset_permissions").select("division_id").eq("asset_id", asset_id).execute()
-    allowed = [p["division_id"] for p in perms.data]
-    if division_id in allowed:
-        return True
-
-    shares = supabase.table("asset_shares").select("id").eq("asset_id", asset_id).eq("to_division_id", division_id).execute()
-    return len(shares.data) > 0
 
 # ── Endpoints ────────────────────────────────────────
 
@@ -286,7 +253,7 @@ def register_with_division(data: RegisterInput, division_id: str):
     }).execute()
     return {"message": "Registrasi berhasil", "user": result.data[0]}
 
-# Assets — urutan penting: route spesifik SEBELUM route dengan path param
+# Assets
 @app.post("/assets/upload")
 async def upload_asset(
     user_id: str = Form(...),
@@ -342,8 +309,13 @@ async def upload_asset(
 
 @app.get("/assets")
 def get_assets(user_id: str):
-    result = supabase.table("assets").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-    return {"assets": result.data}
+    result = supabase.table("assets").select("*, users(nama)").eq("user_id", user_id).order("created_at", desc=True).execute()
+    assets = []
+    for a in result.data:
+        item = {**a, "uploader": a.get("users", {}).get("nama", "—") if a.get("users") else "—"}
+        item.pop("users", None)
+        assets.append(item)
+    return {"assets": assets}
 
 @app.get("/assets/by-division")
 def get_assets_by_division(user_id: str):
@@ -354,26 +326,33 @@ def get_assets_by_division(user_id: str):
     division_id = ud["division_id"]
 
     if division_id == MANAGER_ID:
-        result = supabase.table("assets").select("*").order("created_at", desc=True).execute()
-        return {"assets": result.data}
+        result = supabase.table("assets").select("*, users(nama)").order("created_at", desc=True).execute()
+        assets = []
+        for a in result.data:
+            item = {**a, "uploader": a.get("users", {}).get("nama", "—") if a.get("users") else "—"}
+            item.pop("users", None)
+            assets.append(item)
+        return {"assets": assets}
 
-    public_assets = supabase.table("assets").select("*").eq("is_public", True).order("created_at", desc=True).execute()
+    public_assets = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
 
-    perm_result = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
+    perm_result    = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
     perm_asset_ids = [p["asset_id"] for p in perm_result.data]
 
-    share_result = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
+    share_result    = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
     share_asset_ids = [s["asset_id"] for s in share_result.data]
 
     all_ids = set(perm_asset_ids + share_asset_ids)
     private_assets = []
     if all_ids:
-        private_result = supabase.table("assets").select("*").in_("id", list(all_ids)).eq("is_public", False).execute()
+        private_result = supabase.table("assets").select("*, users(nama)").in_("id", list(all_ids)).eq("is_public", False).execute()
         private_assets = private_result.data
 
-    all_assets = {a["id"]: a for a in public_assets.data}
-    for a in private_assets:
-        all_assets[a["id"]] = a
+    all_assets = {}
+    for a in public_assets.data + private_assets:
+        item = {**a, "uploader": a.get("users", {}).get("nama", "—") if a.get("users") else "—"}
+        item.pop("users", None)
+        all_assets[item["id"]] = item
 
     return {"assets": list(all_assets.values())}
 
@@ -407,11 +386,11 @@ def get_unread_shares(user_id: str):
 @app.post("/assets/share")
 def share_asset(data: ShareInput):
     result = supabase.table("asset_shares").insert({
-        "asset_id":      data.asset_id,
-        "from_user_id":  data.from_user_id,
+        "asset_id":       data.asset_id,
+        "from_user_id":   data.from_user_id,
         "to_division_id": data.to_division_id,
-        "catatan":       data.catatan,
-        "is_read":       False
+        "catatan":        data.catatan,
+        "is_read":        False
     }).execute()
     return {"message": "Aset berhasil dibagikan", "share": result.data[0]}
 
@@ -429,7 +408,7 @@ def set_permissions(data: PermissionInput):
     supabase.table("assets").update({"is_public": False}).eq("id", data.asset_id).execute()
     for div_id in data.division_ids:
         supabase.table("asset_permissions").insert({
-            "asset_id": data.asset_id,
+            "asset_id":    data.asset_id,
             "division_id": div_id
         }).execute()
     return {"message": "Permission diset"}
@@ -441,12 +420,16 @@ def get_permissions(asset_id: str):
 
 @app.get("/assets/{asset_id}")
 def get_asset_detail(asset_id: str):
-    asset = supabase.table("assets").select("*").eq("id", asset_id).execute()
+    asset = supabase.table("assets").select("*, users(nama)").eq("id", asset_id).execute()
     if not asset.data:
         raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
+    a        = asset.data[0]
+    uploader = a.get("users", {}).get("nama", "—") if a.get("users") else "—"
+    a.pop("users", None)
+    a["uploader"] = uploader
     asset_tags = supabase.table("asset_tags").select("*, tags(nama)").eq("asset_id", asset_id).execute()
     tags = [{"nama": at["tags"]["nama"], "sumber": at["sumber"]} for at in asset_tags.data]
-    return {"asset": asset.data[0], "tags": tags}
+    return {"asset": a, "tags": tags}
 
 @app.delete("/assets/{asset_id}")
 def delete_asset(asset_id: str):
@@ -649,7 +632,7 @@ def get_all_users_with_division():
 # Admin
 @app.delete("/admin/users/{user_id}")
 def hapus_user(user_id: str):
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+    assets = supabase.table("assets").select("id, url").eq("user_id", user_id).execute()
     asset_ids = [a["id"] for a in assets.data]
 
     if asset_ids:
@@ -659,7 +642,7 @@ def hapus_user(user_id: str):
         supabase.table("asset_shares").delete().in_("asset_id", asset_ids).execute()
         for a in assets.data:
             try:
-                url  = a.get("url", "")
+                url = a.get("url", "")
                 if "/object/public/assets/" in url:
                     path = url.split("/object/public/assets/")[1]
                     supabase.storage.from_("assets").remove([path])
