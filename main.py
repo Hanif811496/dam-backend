@@ -276,12 +276,17 @@ async def upload_asset(
 
     url_publik = supabase.storage.from_("assets").get_public_url(path_storage)
 
+    # Ambil division_id user
+    ud = get_user_division(user_id)
+    division_id = ud["division_id"] if ud else None
+
     result = supabase.table("assets").insert({
-        "user_id":   user_id,
-        "nama_file": file.filename,
-        "tipe_file": file.content_type,
-        "ukuran":    ukuran,
-        "url":       url_publik
+        "user_id":     user_id,
+        "division_id": division_id,
+        "nama_file":   file.filename,
+        "tipe_file":   file.content_type,
+        "ukuran":      ukuran,
+        "url":         url_publik
     }).execute()
 
     asset_id = result.data[0]["id"]
@@ -656,3 +661,84 @@ def hapus_user(user_id: str):
     supabase.table("users").delete().eq("id", user_id).execute()
 
     return {"message": "Akun berhasil dihapus"}
+
+# ── Admin Report ──────────────────────────────────────
+
+@app.get("/admin/activity")
+def get_activity(limit: int = 20):
+    uploads = supabase.table("assets").select(
+        "id, nama_file, tipe_file, ukuran, created_at, users(nama), divisions(nama)"
+    ).order("created_at", desc=True).limit(limit).execute()
+
+    shares = supabase.table("asset_shares").select(
+        "id, catatan, created_at, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
+    ).order("created_at", desc=True).limit(limit).execute()
+
+    activities = []
+
+    for u in uploads.data:
+        activities.append({
+            "type":      "upload",
+            "user":      u.get("users", {}).get("nama", "—") if u.get("users") else "—",
+            "division":  u.get("divisions", {}).get("nama", "—") if u.get("divisions") else "—",
+            "file":      u["nama_file"],
+            "tipe":      u["tipe_file"],
+            "ukuran":    u["ukuran"],
+            "created_at": u["created_at"]
+        })
+
+    for s in shares.data:
+        activities.append({
+            "type":      "share",
+            "user":      s.get("users", {}).get("nama", "—") if s.get("users") else "—",
+            "division":  s.get("divisions", {}).get("nama", "—") if s.get("divisions") else "—",
+            "file":      s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
+            "catatan":   s.get("catatan", ""),
+            "created_at": s["created_at"]
+        })
+
+    activities.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"activities": activities[:limit]}
+
+@app.get("/admin/report/assets")
+def report_assets():
+    result = supabase.table("assets").select(
+        "*, users(nama), divisions(nama)"
+    ).order("created_at", desc=True).execute()
+
+    assets = []
+    for a in result.data:
+        asset_tags = supabase.table("asset_tags").select("id").eq("asset_id", a["id"]).execute()
+        assets.append({
+            "id":          a["id"],
+            "nama_file":   a["nama_file"],
+            "tipe_file":   a["tipe_file"],
+            "ukuran":      a["ukuran"],
+            "uploader":    a.get("users", {}).get("nama", "—") if a.get("users") else "—",
+            "divisi":      a.get("divisions", {}).get("nama", "—") if a.get("divisions") else "—",
+            "jumlah_tag":  len(asset_tags.data),
+            "is_public":   a.get("is_public", True),
+            "created_at":  a["created_at"]
+        })
+
+    return {"assets": assets}
+
+@app.get("/admin/report/divisions")
+def report_divisions():
+    divisions = supabase.table("divisions").select("*").execute()
+    result    = []
+
+    for d in divisions.data:
+        users  = supabase.table("user_divisions").select("id").eq("division_id", d["id"]).execute()
+        assets = supabase.table("assets").select("id, ukuran").eq("division_id", d["id"]).execute()
+        total_storage = sum(a["ukuran"] for a in assets.data)
+
+        result.append({
+            "id":            d["id"],
+            "nama":          d["nama"],
+            "jumlah_user":   len(users.data),
+            "jumlah_aset":   len(assets.data),
+            "total_storage": total_storage
+        })
+
+    return {"divisions": result}
