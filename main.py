@@ -742,3 +742,52 @@ def report_divisions():
         })
 
     return {"divisions": result}
+
+# ── Profile & Password ───────────────────────────────
+
+class UpdateProfileInput(BaseModel):
+    nama: str
+
+class UpdatePasswordInput(BaseModel):
+    password_lama: str
+    password_baru: str
+
+class AdminUpdateUserInput(BaseModel):
+    nama: Optional[str] = None
+    password_baru: Optional[str] = None
+
+@app.put("/profile/{user_id}")
+def update_profile(user_id: str, data: UpdateProfileInput):
+    if not data.nama.strip():
+        raise HTTPException(status_code=400, detail="Nama tidak boleh kosong")
+    supabase.table("users").update({"nama": data.nama.strip()}).eq("id", user_id).execute()
+    return {"message": "Nama berhasil diupdate"}
+
+@app.put("/profile/{user_id}/password")
+def update_password(user_id: str, data: UpdatePasswordInput):
+    user = supabase.table("users").select("password").eq("id", user_id).execute()
+    if not user.data:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+    if not bcrypt.checkpw(data.password_lama.encode(), user.data[0]["password"].encode()):
+        raise HTTPException(status_code=400, detail="Password lama tidak sesuai")
+    if len(data.password_baru) < 6:
+        raise HTTPException(status_code=400, detail="Password baru minimal 6 karakter")
+    hashed = bcrypt.hashpw(data.password_baru.encode(), bcrypt.gensalt()).decode()
+    supabase.table("users").update({"password": hashed}).eq("id", user_id).execute()
+    return {"message": "Password berhasil diupdate"}
+
+@app.put("/admin/users/{user_id}")
+def admin_update_user(user_id: str, data: AdminUpdateUserInput):
+    payload = {}
+    if data.nama is not None:
+        if not data.nama.strip():
+            raise HTTPException(status_code=400, detail="Nama tidak boleh kosong")
+        payload["nama"] = data.nama.strip()
+    if data.password_baru is not None:
+        if len(data.password_baru) < 6:
+            raise HTTPException(status_code=400, detail="Password minimal 6 karakter")
+        payload["password"] = bcrypt.hashpw(data.password_baru.encode(), bcrypt.gensalt()).decode()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Tidak ada data yang diupdate")
+    supabase.table("users").update(payload).eq("id", user_id).execute()
+    return {"message": "Data user berhasil diupdate"}
