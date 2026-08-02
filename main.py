@@ -59,6 +59,33 @@ class PermissionInput(BaseModel):
     asset_id: str
     division_ids: list
 
+class UpdateProfileInput(BaseModel):
+    nama: str
+
+class UpdatePasswordInput(BaseModel):
+    password_lama: str
+    password_baru: str
+
+class AdminUpdateUserInput(BaseModel):
+    nama: Optional[str] = None
+    password_baru: Optional[str] = None
+
+# ── Division Config ───────────────────────────────────
+MANAGER_ID = "79732e94-d800-4b11-ad92-74e594f1b54b"
+
+# ── Helpers Divisi ────────────────────────────────────
+def get_user_division(user_id: str):
+    result = supabase.table("user_divisions").select("*, divisions(*)").eq("user_id", user_id).execute()
+    if not result.data:
+        return None
+    return result.data[0]
+
+def is_manager(user_id: str) -> bool:
+    ud = get_user_division(user_id)
+    if not ud:
+        return False
+    return ud["division_id"] == MANAGER_ID
+
 # ── Helper: auto tagging ─────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
     stopwords = {"the","and","for","with","dari","dan","untuk","dengan","di","ke","yang","at","in","on"}
@@ -174,11 +201,14 @@ def simpan_tags(asset_id: str, tags: list, sumber: str):
         }).execute()
 
 def auto_assign_folder(asset_id: str, user_id: str, tags: list):
-    rules = supabase.table("folder_rules").select("*, folders(nama)").eq("user_id", user_id).execute()
+    rules = supabase.table("folder_rules").select("*, folders(nama, user_id)").execute()
     if not rules.data:
         return
     for rule in rules.data:
         keyword = rule["keyword"].lower()
+        folder  = rule.get("folders", {})
+        if not folder:
+            continue
         for tag in tags:
             if keyword in tag.lower():
                 already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", rule["folder_id"]).execute()
@@ -189,29 +219,13 @@ def auto_assign_folder(asset_id: str, user_id: str, tags: list):
                     }).execute()
                 break
 
-# ── Division Config ───────────────────────────────────
-MANAGER_ID = "79732e94-d800-4b11-ad92-74e594f1b54b"
-
-# ── Helpers Divisi ────────────────────────────────────
-def get_user_division(user_id: str):
-    result = supabase.table("user_divisions").select("*, divisions(*)").eq("user_id", user_id).execute()
-    if not result.data:
-        return None
-    return result.data[0]
-
-def is_manager(user_id: str) -> bool:
-    ud = get_user_division(user_id)
-    if not ud:
-        return False
-    return ud["division_id"] == MANAGER_ID
-
 # ── Endpoints ────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {"message": "DAM API berjalan", "status": "ok"}
 
-# Auth
+# ── Auth ─────────────────────────────────────────────
 @app.post("/auth/register")
 def register(data: RegisterInput):
     existing = supabase.table("users").select("id").eq("email", data.email).execute()
@@ -253,7 +267,7 @@ def register_with_division(data: RegisterInput, division_id: str):
     }).execute()
     return {"message": "Registrasi berhasil", "user": result.data[0]}
 
-# Assets
+# ── Assets — urutan penting: spesifik SEBELUM path param ──
 @app.post("/assets/upload")
 async def upload_asset(
     user_id: str = Form(...),
@@ -276,8 +290,7 @@ async def upload_asset(
 
     url_publik = supabase.storage.from_("assets").get_public_url(path_storage)
 
-    # Ambil division_id user
-    ud = get_user_division(user_id)
+    ud          = get_user_division(user_id)
     division_id = ud["division_id"] if ud else None
 
     result = supabase.table("assets").insert({
@@ -425,13 +438,21 @@ def get_permissions(asset_id: str):
 
 @app.get("/assets/{asset_id}")
 def get_asset_detail(asset_id: str):
-    asset = supabase.table("assets").select("*, users(nama)").eq("id", asset_id).execute()
+    asset = supabase.table("assets").select("*, users(nama, id)").eq("id", asset_id).execute()
     if not asset.data:
         raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
-    a        = asset.data[0]
-    uploader = a.get("users", {}).get("nama", "—") if a.get("users") else "—"
+    a             = asset.data[0]
+    uploader_nama = a.get("users", {}).get("nama", "—") if a.get("users") else "—"
+    uploader_id   = a.get("users", {}).get("id") if a.get("users") else None
     a.pop("users", None)
-    a["uploader"] = uploader
+    a["uploader"] = uploader_nama
+
+    if uploader_id:
+        ud = get_user_division(uploader_id)
+        a["uploader_divisi"] = ud["divisions"]["nama"] if ud and ud.get("divisions") else "—"
+    else:
+        a["uploader_divisi"] = "—"
+
     asset_tags = supabase.table("asset_tags").select("*, tags(nama)").eq("asset_id", asset_id).execute()
     tags = [{"nama": at["tags"]["nama"], "sumber": at["sumber"]} for at in asset_tags.data]
     return {"asset": a, "tags": tags}
@@ -476,7 +497,7 @@ def hapus_tag(asset_id: str, nama_tag: str):
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).eq("tag_id", tag_id).execute()
     return {"message": "Tag dihapus"}
 
-# Tags
+# ── Tags ─────────────────────────────────────────────
 @app.get("/tags")
 def get_tags_by_user(user_id: str):
     assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
@@ -496,21 +517,29 @@ def get_tags_by_user(user_id: str):
 
 @app.get("/tags/count")
 def count_tags(user_id: str):
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
-    asset_ids = [a["id"] for a in assets.data]
-    if not asset_ids:
-        return {"count": 0}
-    result = supabase.table("asset_tags").select("tag_id").in_("asset_id", asset_ids).execute()
+    ud = get_user_division(user_id)
+    if ud and ud["division_id"] == MANAGER_ID:
+        result = supabase.table("asset_tags").select("tag_id").execute()
+    else:
+        assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+        asset_ids = [a["id"] for a in assets.data]
+        if not asset_ids:
+            return {"count": 0}
+        result = supabase.table("asset_tags").select("tag_id").in_("asset_id", asset_ids).execute()
     unique_tags = set(at["tag_id"] for at in result.data)
     return {"count": len(unique_tags)}
 
 @app.get("/tags/top")
 def top_tags(user_id: str, limit: int = 7):
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
-    asset_ids = [a["id"] for a in assets.data]
-    if not asset_ids:
-        return {"tags": []}
-    result = supabase.table("asset_tags").select("tag_id, tags(nama)").in_("asset_id", asset_ids).execute()
+    ud = get_user_division(user_id)
+    if ud and ud["division_id"] == MANAGER_ID:
+        result = supabase.table("asset_tags").select("tag_id, tags(nama)").execute()
+    else:
+        assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+        asset_ids = [a["id"] for a in assets.data]
+        if not asset_ids:
+            return {"tags": []}
+        result = supabase.table("asset_tags").select("tag_id, tags(nama)").in_("asset_id", asset_ids).execute()
     count = {}
     for item in result.data:
         nama = item["tags"]["nama"]
@@ -518,7 +547,7 @@ def top_tags(user_id: str, limit: int = 7):
     sorted_tags = sorted(count.items(), key=lambda x: x[1], reverse=True)[:limit]
     return {"tags": [{"nama": t[0], "jumlah": t[1]} for t in sorted_tags]}
 
-# Search
+# ── Search ───────────────────────────────────────────
 @app.get("/search/by-tag")
 def get_assets_by_tag(user_id: str, tag: str):
     tag_result = supabase.table("tags").select("id").eq("nama", tag).execute()
@@ -531,14 +560,20 @@ def get_assets_by_tag(user_id: str, tag: str):
     asset_ids = [at["asset_id"] for at in at_result.data]
     return {"asset_ids": asset_ids}
 
-# Stats
+# ── Stats ────────────────────────────────────────────
 @app.get("/stats/tagging")
 def stats_tagging(user_id: str):
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
-    asset_ids = [a["id"] for a in assets.data]
-    if not asset_ids:
-        return {"total": 0, "nama_file": 0, "metadata": 0, "ai": 0, "manual": 0}
-    result = supabase.table("asset_tags").select("sumber").in_("asset_id", asset_ids).execute()
+    ud = get_user_division(user_id)
+    if ud and ud["division_id"] == MANAGER_ID:
+        result = supabase.table("asset_tags").select("sumber").execute()
+    else:
+        assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
+        asset_ids = [a["id"] for a in assets.data]
+        if not asset_ids:
+            return {"total": 0, "nama_file": 0, "metadata": 0, "ai": 0, "manual": 0,
+                    "pct_nama_file": 0, "pct_metadata": 0, "pct_ai": 0, "pct_manual": 0}
+        result = supabase.table("asset_tags").select("sumber").in_("asset_id", asset_ids).execute()
+
     total     = len(result.data)
     nama_file = sum(1 for r in result.data if r["sumber"] == "nama_file")
     metadata  = sum(1 for r in result.data if r["sumber"] == "metadata")
@@ -556,7 +591,7 @@ def stats_tagging(user_id: str):
         "pct_manual":    round(manual    / total * 100) if total else 0,
     }
 
-# Folders
+# ── Folders ──────────────────────────────────────────
 @app.post("/folders")
 def buat_folder(data: FolderInput):
     payload = {"nama": data.nama, "user_id": data.user_id}
@@ -602,7 +637,7 @@ def get_assets_by_folder(folder_id: str):
     assets = [r["assets"] for r in result.data if r["assets"]]
     return {"assets": assets}
 
-# Divisions
+# ── Divisions ────────────────────────────────────────
 @app.get("/divisions")
 def get_divisions():
     result = supabase.table("divisions").select("*").order("nama").execute()
@@ -634,128 +669,7 @@ def get_all_users_with_division():
         result.append({**u, "division": division})
     return {"users": result}
 
-# Admin
-@app.delete("/admin/users/{user_id}")
-def hapus_user(user_id: str):
-    assets = supabase.table("assets").select("id, url").eq("user_id", user_id).execute()
-    asset_ids = [a["id"] for a in assets.data]
-
-    if asset_ids:
-        supabase.table("asset_tags").delete().in_("asset_id", asset_ids).execute()
-        supabase.table("asset_folders").delete().in_("asset_id", asset_ids).execute()
-        supabase.table("asset_permissions").delete().in_("asset_id", asset_ids).execute()
-        supabase.table("asset_shares").delete().in_("asset_id", asset_ids).execute()
-        for a in assets.data:
-            try:
-                url = a.get("url", "")
-                if "/object/public/assets/" in url:
-                    path = url.split("/object/public/assets/")[1]
-                    supabase.storage.from_("assets").remove([path])
-            except:
-                pass
-        supabase.table("assets").delete().eq("user_id", user_id).execute()
-
-    supabase.table("folder_rules").delete().eq("user_id", user_id).execute()
-    supabase.table("folders").delete().eq("user_id", user_id).execute()
-    supabase.table("user_divisions").delete().eq("user_id", user_id).execute()
-    supabase.table("users").delete().eq("id", user_id).execute()
-
-    return {"message": "Akun berhasil dihapus"}
-
-# ── Admin Report ──────────────────────────────────────
-
-@app.get("/admin/activity")
-def get_activity(limit: int = 20):
-    uploads = supabase.table("assets").select(
-        "id, nama_file, tipe_file, ukuran, created_at, users(nama), divisions(nama)"
-    ).order("created_at", desc=True).limit(limit).execute()
-
-    shares = supabase.table("asset_shares").select(
-        "id, catatan, created_at, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
-    ).order("created_at", desc=True).limit(limit).execute()
-
-    activities = []
-
-    for u in uploads.data:
-        activities.append({
-            "type":      "upload",
-            "user":      u.get("users", {}).get("nama", "—") if u.get("users") else "—",
-            "division":  u.get("divisions", {}).get("nama", "—") if u.get("divisions") else "—",
-            "file":      u["nama_file"],
-            "tipe":      u["tipe_file"],
-            "ukuran":    u["ukuran"],
-            "created_at": u["created_at"]
-        })
-
-    for s in shares.data:
-        activities.append({
-            "type":      "share",
-            "user":      s.get("users", {}).get("nama", "—") if s.get("users") else "—",
-            "division":  s.get("divisions", {}).get("nama", "—") if s.get("divisions") else "—",
-            "file":      s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
-            "catatan":   s.get("catatan", ""),
-            "created_at": s["created_at"]
-        })
-
-    activities.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"activities": activities[:limit]}
-
-@app.get("/admin/report/assets")
-def report_assets():
-    result = supabase.table("assets").select(
-        "*, users(nama), divisions(nama)"
-    ).order("created_at", desc=True).execute()
-
-    assets = []
-    for a in result.data:
-        asset_tags = supabase.table("asset_tags").select("id").eq("asset_id", a["id"]).execute()
-        assets.append({
-            "id":          a["id"],
-            "nama_file":   a["nama_file"],
-            "tipe_file":   a["tipe_file"],
-            "ukuran":      a["ukuran"],
-            "uploader":    a.get("users", {}).get("nama", "—") if a.get("users") else "—",
-            "divisi":      a.get("divisions", {}).get("nama", "—") if a.get("divisions") else "—",
-            "jumlah_tag":  len(asset_tags.data),
-            "is_public":   a.get("is_public", True),
-            "created_at":  a["created_at"]
-        })
-
-    return {"assets": assets}
-
-@app.get("/admin/report/divisions")
-def report_divisions():
-    divisions = supabase.table("divisions").select("*").execute()
-    result    = []
-
-    for d in divisions.data:
-        users  = supabase.table("user_divisions").select("id").eq("division_id", d["id"]).execute()
-        assets = supabase.table("assets").select("id, ukuran").eq("division_id", d["id"]).execute()
-        total_storage = sum(a["ukuran"] for a in assets.data)
-
-        result.append({
-            "id":            d["id"],
-            "nama":          d["nama"],
-            "jumlah_user":   len(users.data),
-            "jumlah_aset":   len(assets.data),
-            "total_storage": total_storage
-        })
-
-    return {"divisions": result}
-
 # ── Profile & Password ───────────────────────────────
-
-class UpdateProfileInput(BaseModel):
-    nama: str
-
-class UpdatePasswordInput(BaseModel):
-    password_lama: str
-    password_baru: str
-
-class AdminUpdateUserInput(BaseModel):
-    nama: Optional[str] = None
-    password_baru: Optional[str] = None
-
 @app.put("/profile/{user_id}")
 def update_profile(user_id: str, data: UpdateProfileInput):
     if not data.nama.strip():
@@ -776,6 +690,7 @@ def update_password(user_id: str, data: UpdatePasswordInput):
     supabase.table("users").update({"password": hashed}).eq("id", user_id).execute()
     return {"message": "Password berhasil diupdate"}
 
+# ── Admin ────────────────────────────────────────────
 @app.put("/admin/users/{user_id}")
 def admin_update_user(user_id: str, data: AdminUpdateUserInput):
     payload = {}
@@ -791,3 +706,102 @@ def admin_update_user(user_id: str, data: AdminUpdateUserInput):
         raise HTTPException(status_code=400, detail="Tidak ada data yang diupdate")
     supabase.table("users").update(payload).eq("id", user_id).execute()
     return {"message": "Data user berhasil diupdate"}
+
+@app.delete("/admin/users/{user_id}")
+def hapus_user(user_id: str):
+    assets = supabase.table("assets").select("id, url").eq("user_id", user_id).execute()
+    asset_ids = [a["id"] for a in assets.data]
+    if asset_ids:
+        supabase.table("asset_tags").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_folders").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_permissions").delete().in_("asset_id", asset_ids).execute()
+        supabase.table("asset_shares").delete().in_("asset_id", asset_ids).execute()
+        for a in assets.data:
+            try:
+                url = a.get("url", "")
+                if "/object/public/assets/" in url:
+                    path = url.split("/object/public/assets/")[1]
+                    supabase.storage.from_("assets").remove([path])
+            except:
+                pass
+        supabase.table("assets").delete().eq("user_id", user_id).execute()
+    supabase.table("folder_rules").delete().eq("user_id", user_id).execute()
+    supabase.table("folders").delete().eq("user_id", user_id).execute()
+    supabase.table("user_divisions").delete().eq("user_id", user_id).execute()
+    supabase.table("users").delete().eq("id", user_id).execute()
+    return {"message": "Akun berhasil dihapus"}
+
+@app.get("/admin/activity")
+def get_activity(limit: int = 30):
+    uploads = supabase.table("assets").select(
+        "id, nama_file, tipe_file, ukuran, created_at, users(nama), divisions(nama)"
+    ).order("created_at", desc=True).limit(limit).execute()
+
+    shares = supabase.table("asset_shares").select(
+        "id, catatan, created_at, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
+    ).order("created_at", desc=True).limit(limit).execute()
+
+    activities = []
+
+    for u in uploads.data:
+        activities.append({
+            "type":       "upload",
+            "user":       u.get("users", {}).get("nama", "—") if u.get("users") else "—",
+            "division":   u.get("divisions", {}).get("nama", "—") if u.get("divisions") else "—",
+            "file":       u["nama_file"],
+            "tipe":       u["tipe_file"],
+            "ukuran":     u["ukuran"],
+            "created_at": u["created_at"]
+        })
+
+    for s in shares.data:
+        activities.append({
+            "type":       "share",
+            "user":       s.get("users", {}).get("nama", "—") if s.get("users") else "—",
+            "division":   s.get("divisions", {}).get("nama", "—") if s.get("divisions") else "—",
+            "file":       s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
+            "catatan":    s.get("catatan", ""),
+            "created_at": s["created_at"]
+        })
+
+    activities.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"activities": activities[:limit]}
+
+@app.get("/admin/report/assets")
+def report_assets():
+    result = supabase.table("assets").select(
+        "*, users(nama), divisions(nama)"
+    ).order("created_at", desc=True).execute()
+
+    assets = []
+    for a in result.data:
+        asset_tags = supabase.table("asset_tags").select("id").eq("asset_id", a["id"]).execute()
+        assets.append({
+            "id":         a["id"],
+            "nama_file":  a["nama_file"],
+            "tipe_file":  a["tipe_file"],
+            "ukuran":     a["ukuran"],
+            "uploader":   a.get("users", {}).get("nama", "—") if a.get("users") else "—",
+            "divisi":     a.get("divisions", {}).get("nama", "—") if a.get("divisions") else "—",
+            "jumlah_tag": len(asset_tags.data),
+            "is_public":  a.get("is_public", True),
+            "created_at": a["created_at"]
+        })
+    return {"assets": assets}
+
+@app.get("/admin/report/divisions")
+def report_divisions():
+    divisions = supabase.table("divisions").select("*").execute()
+    result    = []
+    for d in divisions.data:
+        users  = supabase.table("user_divisions").select("id").eq("division_id", d["id"]).execute()
+        assets = supabase.table("assets").select("id, ukuran").eq("division_id", d["id"]).execute()
+        total_storage = sum(a["ukuran"] for a in assets.data)
+        result.append({
+            "id":            d["id"],
+            "nama":          d["nama"],
+            "jumlah_user":   len(users.data),
+            "jumlah_aset":   len(assets.data),
+            "total_storage": total_storage
+        })
+    return {"divisions": result}
