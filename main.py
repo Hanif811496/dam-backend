@@ -73,7 +73,7 @@ class AdminUpdateUserInput(BaseModel):
 # ── Division Config ───────────────────────────────────
 MANAGER_ID = "79732e94-d800-4b11-ad92-74e594f1b54b"
 
-# ── Helpers Divisi ────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────
 def get_user_division(user_id: str):
     result = supabase.table("user_divisions").select("*, divisions(*)").eq("user_id", user_id).execute()
     if not result.data:
@@ -86,7 +86,7 @@ def is_manager(user_id: str) -> bool:
         return False
     return ud["division_id"] == MANAGER_ID
 
-# ── Helper: auto tagging ─────────────────────────────
+# ── Auto Tagging Helpers ──────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
     stopwords = {"the","and","for","with","dari","dan","untuk","dengan","di","ke","yang","at","in","on"}
     nama   = os.path.splitext(nama_file)[0]
@@ -119,12 +119,10 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
     if mb < 1:    tags.append("file-kecil")
     elif mb < 10: tags.append("file-sedang")
     else:         tags.append("file-besar")
-
     return tags
 
 def tag_dari_imagga(url_gambar: str) -> list:
     tags = []
-
     try:
         response = requests.get(
             "https://api.imagga.com/v2/tags",
@@ -201,6 +199,7 @@ def simpan_tags(asset_id: str, tags: list, sumber: str):
         }).execute()
 
 def auto_assign_folder(asset_id: str, user_id: str, tags: list):
+    # Ambil semua rules dari semua user — folder bersifat global
     rules = supabase.table("folder_rules").select("*, folders(nama, user_id)").execute()
     if not rules.data:
         return
@@ -219,8 +218,7 @@ def auto_assign_folder(asset_id: str, user_id: str, tags: list):
                     }).execute()
                 break
 
-# ── Endpoints ────────────────────────────────────────
-
+# ── Root ─────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"message": "DAM API berjalan", "status": "ok"}
@@ -267,7 +265,7 @@ def register_with_division(data: RegisterInput, division_id: str):
     }).execute()
     return {"message": "Registrasi berhasil", "user": result.data[0]}
 
-# ── Assets — urutan penting: spesifik SEBELUM path param ──
+# ── Assets ───────────────────────────────────────────
 @app.post("/assets/upload")
 async def upload_asset(
     user_id: str = Form(...),
@@ -288,8 +286,7 @@ async def upload_asset(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal upload ke storage: {str(e)}")
 
-    url_publik = supabase.storage.from_("assets").get_public_url(path_storage)
-
+    url_publik  = supabase.storage.from_("assets").get_public_url(path_storage)
     ud          = get_user_division(user_id)
     division_id = ud["division_id"] if ud else None
 
@@ -302,8 +299,7 @@ async def upload_asset(
         "url":         url_publik
     }).execute()
 
-    asset_id = result.data[0]["id"]
-
+    asset_id  = result.data[0]["id"]
     tags_nama = tag_dari_nama_file(file.filename)
     simpan_tags(asset_id, tags_nama, "nama_file")
 
@@ -352,12 +348,10 @@ def get_assets_by_division(user_id: str):
             assets.append(item)
         return {"assets": assets}
 
-    public_assets = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
-
+    public_assets  = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
     perm_result    = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
     perm_asset_ids = [p["asset_id"] for p in perm_result.data]
-
-    share_result    = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
+    share_result   = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
     share_asset_ids = [s["asset_id"] for s in share_result.data]
 
     all_ids = set(perm_asset_ids + share_asset_ids)
@@ -602,8 +596,14 @@ def buat_folder(data: FolderInput):
 
 @app.get("/folders")
 def get_folders(user_id: str):
-    result = supabase.table("folders").select("*").eq("user_id", user_id).order("nama").execute()
-    return {"folders": result.data}
+    # Global — semua folder dari semua user
+    result = supabase.table("folders").select("*, users(nama)").order("nama").execute()
+    folders = []
+    for f in result.data:
+        item = {**f, "owner": f.get("users", {}).get("nama", "—") if f.get("users") else "—"}
+        item.pop("users", None)
+        folders.append(item)
+    return {"folders": folders}
 
 @app.delete("/folders/{folder_id}")
 def hapus_folder(folder_id: str):
@@ -623,7 +623,8 @@ def buat_rule(data: RuleInput):
 
 @app.get("/folders/rules")
 def get_rules(user_id: str):
-    result = supabase.table("folder_rules").select("*, folders(nama)").eq("user_id", user_id).execute()
+    # Global — semua rules dari semua user
+    result = supabase.table("folder_rules").select("*, folders(nama)").execute()
     return {"rules": result.data}
 
 @app.delete("/folders/rules/{rule_id}")
@@ -742,7 +743,6 @@ def get_activity(limit: int = 30):
     ).order("created_at", desc=True).limit(limit).execute()
 
     activities = []
-
     for u in uploads.data:
         activities.append({
             "type":       "upload",
@@ -753,7 +753,6 @@ def get_activity(limit: int = 30):
             "ukuran":     u["ukuran"],
             "created_at": u["created_at"]
         })
-
     for s in shares.data:
         activities.append({
             "type":       "share",
