@@ -908,9 +908,16 @@ def report_assets():
     result = supabase.table("assets").select(
         "*, users(nama), divisions(nama)"
     ).order("created_at", desc=True).execute()
+
+    asset_ids = [a["id"] for a in result.data]
+    tag_count = {}
+    if asset_ids:
+        tags_result = supabase.table("asset_tags").select("asset_id").in_("asset_id", asset_ids).execute()
+        for t in tags_result.data:
+            tag_count[t["asset_id"]] = tag_count.get(t["asset_id"], 0) + 1
+
     assets = []
     for a in result.data:
-        asset_tags = supabase.table("asset_tags").select("id").eq("asset_id", a["id"]).execute()
         assets.append({
             "id":         a["id"],
             "nama_file":  a["nama_file"],
@@ -918,7 +925,7 @@ def report_assets():
             "ukuran":     a["ukuran"],
             "uploader":   a.get("users", {}).get("nama", "—") if a.get("users") else "—",
             "divisi":     a.get("divisions", {}).get("nama", "—") if a.get("divisions") else "—",
-            "jumlah_tag": len(asset_tags.data),
+            "jumlah_tag": tag_count.get(a["id"], 0),
             "is_public":  a.get("is_public", True),
             "created_at": a["created_at"]
         })
@@ -927,16 +934,28 @@ def report_assets():
 @app.get("/admin/report/divisions")
 def report_divisions():
     divisions = supabase.table("divisions").select("*").execute()
-    result    = []
+
+    users_result  = supabase.table("user_divisions").select("division_id").execute()
+    assets_result = supabase.table("assets").select("division_id, ukuran").execute()
+
+    user_count  = {}
+    for u in users_result.data:
+        user_count[u["division_id"]] = user_count.get(u["division_id"], 0) + 1
+
+    asset_count   = {}
+    storage_total = {}
+    for a in assets_result.data:
+        did = a["division_id"]
+        asset_count[did]   = asset_count.get(did, 0) + 1
+        storage_total[did] = storage_total.get(did, 0) + a["ukuran"]
+
+    result = []
     for d in divisions.data:
-        users  = supabase.table("user_divisions").select("id").eq("division_id", d["id"]).execute()
-        assets = supabase.table("assets").select("id, ukuran").eq("division_id", d["id"]).execute()
-        total_storage = sum(a["ukuran"] for a in assets.data)
         result.append({
             "id":            d["id"],
             "nama":          d["nama"],
-            "jumlah_user":   len(users.data),
-            "jumlah_aset":   len(assets.data),
-            "total_storage": total_storage
+            "jumlah_user":   user_count.get(d["id"], 0),
+            "jumlah_aset":   asset_count.get(d["id"], 0),
+            "total_storage": storage_total.get(d["id"], 0)
         })
     return {"divisions": result}
