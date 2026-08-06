@@ -43,6 +43,11 @@ class FolderInput(BaseModel):
     nama: str
     parent_id: Optional[str] = None
     user_id: str
+    target_division_id: Optional[str] = None
+
+class FolderAccessInput(BaseModel):
+    user_ids: list
+    granted_by: str
 
 class RuleInput(BaseModel):
     user_id: str
@@ -85,6 +90,25 @@ def is_manager(user_id: str) -> bool:
     if not ud:
         return False
     return ud["division_id"] == MANAGER_ID
+
+def has_folder_access(user_id: str, folder_id: str) -> bool:
+    result = supabase.table("folder_access").select("id").eq("folder_id", folder_id).eq("user_id", user_id).execute()
+    return len(result.data) > 0
+
+def can_access_folder(user_id: str, folder: dict) -> bool:
+    if is_manager(user_id):
+        return True
+    if folder.get("user_id") == user_id:
+        return True
+    ud = get_user_division(user_id)
+    division_id = ud["division_id"] if ud else None
+    if folder.get("type") == "shared":
+        return True
+    if folder.get("division_id") and division_id == folder.get("division_id"):
+        return True
+    if has_folder_access(user_id, folder["id"]):
+        return True
+    return False
 
 # ── Auto Tagging ──────────────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
@@ -629,6 +653,12 @@ def buat_smart_folder(data: FolderInput):
     if not ud:
         raise HTTPException(status_code=400, detail="User tidak memiliki divisi")
     division_id = ud["division_id"]
+
+    if data.target_division_id and data.target_division_id != division_id:
+        if not is_manager(data.user_id):
+            raise HTTPException(status_code=403, detail="Hanya Manager yang bisa membuat smart folder untuk divisi lain")
+        division_id = data.target_division_id
+
     result = supabase.table("folders").insert({
         "nama":        data.nama,
         "type":        "smart",
@@ -645,13 +675,25 @@ def get_folders(user_id: str):
 
     if division_id == MANAGER_ID:
         result = supabase.table("folders").select("*, users(nama), divisions(nama)").order("type").order("nama").execute()
+        folder_rows = result.data
     else:
         result = supabase.table("folders").select("*, users(nama), divisions(nama)").or_(
             f"type.eq.shared,and(type.eq.system,division_id.eq.{division_id}),and(type.eq.smart,division_id.eq.{division_id})"
         ).order("type").order("nama").execute()
+        folder_rows = list(result.data)
+
+        access_result = supabase.table("folder_access").select("folder_id").eq("user_id", user_id).execute()
+        shared_folder_ids = [a["folder_id"] for a in access_result.data]
+        existing_ids = {f["id"] for f in folder_rows}
+        new_ids = [fid for fid in shared_folder_ids if fid not in existing_ids]
+        if new_ids:
+            shared_rows = supabase.table("folders").select("*, users(nama), divisions(nama)").in_("id", new_ids).execute()
+            for f in shared_rows.data:
+                f["shared_to_me"] = True
+                folder_rows.append(f)
 
     folders = []
-    for f in result.data:
+    for f in folder_rows:
         item = {
             **f,
             "owner":    f.get("users", {}).get("nama", "—") if f.get("users") else "—",
@@ -666,8 +708,41 @@ def get_folders(user_id: str):
 def hapus_folder(folder_id: str):
     supabase.table("asset_folders").delete().eq("folder_id", folder_id).execute()
     supabase.table("folder_rules").delete().eq("folder_id", folder_id).execute()
+    supabase.table("folder_access").delete().eq("folder_id", folder_id).execute()
     supabase.table("folders").delete().eq("id", folder_id).execute()
     return {"message": "Folder dihapus"}
+
+# ── Folder Access (share smart folder ke user tertentu) ──
+@app.post("/folders/{folder_id}/access")
+def set_folder_access(folder_id: str, data: FolderAccessInput):
+    folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    f = folder.data[0]
+    if not (is_manager(data.granted_by) or f.get("user_id") == data.granted_by):
+        raise HTTPException(status_code=403, detail="Tidak punya izin membagikan folder ini")
+
+    existing = supabase.table("folder_access").select("user_id").eq("folder_id", folder_id).execute()
+    existing_ids = {e["user_id"] for e in existing.data}
+    for uid in data.user_ids:
+        if uid not in existing_ids:
+            supabase.table("folder_access").insert({
+                "folder_id":   folder_id,
+                "user_id":     uid,
+                "granted_by":  data.granted_by
+            }).execute()
+    return {"message": "Akses folder diperbarui"}
+
+@app.get("/folders/{folder_id}/access")
+def get_folder_access(folder_id: str):
+    result = supabase.table("folder_access").select("*, users(id, nama, email)").eq("folder_id", folder_id).execute()
+    users = [{**r["users"]} for r in result.data if r.get("users")]
+    return {"users": users}
+
+@app.delete("/folders/{folder_id}/access/{user_id}")
+def hapus_folder_access(folder_id: str, user_id: str):
+    supabase.table("folder_access").delete().eq("folder_id", folder_id).eq("user_id", user_id).execute()
+    return {"message": "Akses dicabut"}
 
 @app.post("/folders/rules")
 def buat_rule(data: RuleInput):
@@ -689,7 +764,14 @@ def hapus_rule(rule_id: str):
     return {"message": "Rule dihapus"}
 
 @app.get("/folders/{folder_id}/assets")
-def get_assets_by_folder(folder_id: str):
+def get_assets_by_folder(folder_id: str, user_id: Optional[str] = None):
+    if user_id:
+        folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
+        if not folder.data:
+            raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+        if not can_access_folder(user_id, folder.data[0]):
+            raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
+
     result = supabase.table("asset_folders").select("asset_id, assets(*)").eq("folder_id", folder_id).execute()
     assets = [r["assets"] for r in result.data if r["assets"]]
     return {"assets": assets}
