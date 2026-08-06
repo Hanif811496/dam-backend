@@ -86,7 +86,7 @@ def is_manager(user_id: str) -> bool:
         return False
     return ud["division_id"] == MANAGER_ID
 
-# ── Auto Tagging Helpers ──────────────────────────────
+# ── Auto Tagging ──────────────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
     stopwords = {"the","and","for","with","dari","dan","untuk","dengan","di","ke","yang","at","in","on"}
     nama   = os.path.splitext(nama_file)[0]
@@ -114,7 +114,6 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
     elif "spreadsheet" in tipe or "excel" in tipe:
         tags.append("excel")
         tags.append("spreadsheet")
-
     mb = ukuran / (1024 * 1024)
     if mb < 1:    tags.append("file-kecil")
     elif mb < 10: tags.append("file-sedang")
@@ -198,9 +197,21 @@ def simpan_tags(asset_id: str, tags: list, sumber: str):
             "sumber":   sumber
         }).execute()
 
-def auto_assign_folder(asset_id: str, user_id: str, tags: list):
-    # Ambil semua rules dari semua user — folder bersifat global
-    rules = supabase.table("folder_rules").select("*, folders(nama, user_id)").execute()
+def auto_assign_folder(asset_id: str, user_id: str, tags: list, division_id: str = None):
+    # 1. Auto masukkan ke folder system divisi uploader
+    if division_id:
+        div_folder = supabase.table("folders").select("id").eq("division_id", division_id).eq("type", "system").execute()
+        if div_folder.data:
+            folder_id = div_folder.data[0]["id"]
+            already   = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
+            if not already.data:
+                supabase.table("asset_folders").insert({
+                    "asset_id":  asset_id,
+                    "folder_id": folder_id
+                }).execute()
+
+    # 2. Auto assign berdasarkan smart folder rules
+    rules = supabase.table("folder_rules").select("*, folders(nama, type, division_id)").execute()
     if not rules.data:
         return
     for rule in rules.data:
@@ -312,7 +323,7 @@ async def upload_asset(
         simpan_tags(asset_id, tags_ai, "ai")
 
     semua_tags = tags_nama + tags_tipe + tags_ai
-    auto_assign_folder(asset_id, user_id, semua_tags)
+    auto_assign_folder(asset_id, user_id, semua_tags, division_id)
 
     return {
         "message": "Upload berhasil",
@@ -348,10 +359,10 @@ def get_assets_by_division(user_id: str):
             assets.append(item)
         return {"assets": assets}
 
-    public_assets  = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
-    perm_result    = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
-    perm_asset_ids = [p["asset_id"] for p in perm_result.data]
-    share_result   = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
+    public_assets   = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
+    perm_result     = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
+    perm_asset_ids  = [p["asset_id"] for p in perm_result.data]
+    share_result    = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
     share_asset_ids = [s["asset_id"] for s in share_result.data]
 
     all_ids = set(perm_asset_ids + share_asset_ids)
@@ -491,6 +502,25 @@ def hapus_tag(asset_id: str, nama_tag: str):
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).eq("tag_id", tag_id).execute()
     return {"message": "Tag dihapus"}
 
+@app.post("/folders/{folder_id}/add-asset")
+def add_asset_to_folder(folder_id: str, asset_id: str, user_id: str):
+    folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    f           = folder.data[0]
+    ud          = get_user_division(user_id)
+    division_id = ud["division_id"] if ud else None
+    if f["type"] == "system":
+        if division_id != f.get("division_id") and division_id != MANAGER_ID:
+            raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
+    already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
+    if not already.data:
+        supabase.table("asset_folders").insert({
+            "asset_id":  asset_id,
+            "folder_id": folder_id
+        }).execute()
+    return {"message": "Aset ditambahkan ke folder"}
+
 # ── Tags ─────────────────────────────────────────────
 @app.get("/tags")
 def get_tags_by_user(user_id: str):
@@ -567,7 +597,6 @@ def stats_tagging(user_id: str):
             return {"total": 0, "nama_file": 0, "metadata": 0, "ai": 0, "manual": 0,
                     "pct_nama_file": 0, "pct_metadata": 0, "pct_ai": 0, "pct_manual": 0}
         result = supabase.table("asset_tags").select("sumber").in_("asset_id", asset_ids).execute()
-
     total     = len(result.data)
     nama_file = sum(1 for r in result.data if r["sumber"] == "nama_file")
     metadata  = sum(1 for r in result.data if r["sumber"] == "metadata")
@@ -588,20 +617,48 @@ def stats_tagging(user_id: str):
 # ── Folders ──────────────────────────────────────────
 @app.post("/folders")
 def buat_folder(data: FolderInput):
-    payload = {"nama": data.nama, "user_id": data.user_id}
+    payload = {"nama": data.nama, "type": "smart", "user_id": data.user_id}
     if data.parent_id:
         payload["parent_id"] = data.parent_id
     result = supabase.table("folders").insert(payload).execute()
     return {"message": "Folder dibuat", "folder": result.data[0]}
 
+@app.post("/folders/smart")
+def buat_smart_folder(data: FolderInput):
+    ud = get_user_division(data.user_id)
+    if not ud:
+        raise HTTPException(status_code=400, detail="User tidak memiliki divisi")
+    division_id = ud["division_id"]
+    result = supabase.table("folders").insert({
+        "nama":        data.nama,
+        "type":        "smart",
+        "division_id": division_id,
+        "user_id":     data.user_id,
+        "parent_id":   data.parent_id
+    }).execute()
+    return {"message": "Smart folder dibuat", "folder": result.data[0]}
+
 @app.get("/folders")
 def get_folders(user_id: str):
-    # Global — semua folder dari semua user
-    result = supabase.table("folders").select("*, users(nama)").order("nama").execute()
+    ud          = get_user_division(user_id)
+    division_id = ud["division_id"] if ud else None
+
+    if division_id == MANAGER_ID:
+        result = supabase.table("folders").select("*, users(nama), divisions(nama)").order("type").order("nama").execute()
+    else:
+        result = supabase.table("folders").select("*, users(nama), divisions(nama)").or_(
+            f"type.eq.shared,and(type.eq.system,division_id.eq.{division_id}),and(type.eq.smart,division_id.eq.{division_id})"
+        ).order("type").order("nama").execute()
+
     folders = []
     for f in result.data:
-        item = {**f, "owner": f.get("users", {}).get("nama", "—") if f.get("users") else "—"}
+        item = {
+            **f,
+            "owner":    f.get("users", {}).get("nama", "—") if f.get("users") else "—",
+            "div_nama": f.get("divisions", {}).get("nama", "") if f.get("divisions") else "",
+        }
         item.pop("users", None)
+        item.pop("divisions", None)
         folders.append(item)
     return {"folders": folders}
 
@@ -623,7 +680,6 @@ def buat_rule(data: RuleInput):
 
 @app.get("/folders/rules")
 def get_rules(user_id: str):
-    # Global — semua rules dari semua user
     result = supabase.table("folder_rules").select("*, folders(nama)").execute()
     return {"rules": result.data}
 
@@ -762,7 +818,6 @@ def get_activity(limit: int = 30):
             "catatan":    s.get("catatan", ""),
             "created_at": s["created_at"]
         })
-
     activities.sort(key=lambda x: x["created_at"], reverse=True)
     return {"activities": activities[:limit]}
 
@@ -771,7 +826,6 @@ def report_assets():
     result = supabase.table("assets").select(
         "*, users(nama), divisions(nama)"
     ).order("created_at", desc=True).execute()
-
     assets = []
     for a in result.data:
         asset_tags = supabase.table("asset_tags").select("id").eq("asset_id", a["id"]).execute()
