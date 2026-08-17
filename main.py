@@ -344,11 +344,15 @@ async def upload_asset(
     ud          = get_user_division(user_id)
     division_id = ud["division_id"] if ud else None
 
-    # Manager/admin bisa upload langsung ke folder divisi lain
+    # Manager/admin bisa upload langsung ke folder divisi lain.
+    # Kalau ini terjadi, aset otomatis jadi privat khusus untuk divisi
+    # tujuan itu saja (tidak publik ke semua divisi seperti upload biasa).
+    is_cross_division = False
     if target_division_id and target_division_id != division_id:
         if not is_manager(user_id):
             raise HTTPException(status_code=403, detail="Hanya Manager yang bisa upload ke divisi lain")
         division_id = target_division_id
+        is_cross_division = True
 
     result = supabase.table("assets").insert({
         "user_id":     user_id,
@@ -356,10 +360,18 @@ async def upload_asset(
         "nama_file":   file.filename,
         "tipe_file":   file.content_type,
         "ukuran":      ukuran,
-        "url":         url_publik
+        "url":         url_publik,
+        "is_public":   not is_cross_division
     }).execute()
 
-    asset_id  = result.data[0]["id"]
+    asset_id = result.data[0]["id"]
+
+    if is_cross_division:
+        supabase.table("asset_permissions").insert({
+            "asset_id":    asset_id,
+            "division_id": division_id
+        }).execute()
+
     tags_nama = tag_dari_nama_file(file.filename)
     simpan_tags(asset_id, tags_nama, "nama_file")
 
