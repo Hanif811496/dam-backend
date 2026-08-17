@@ -149,11 +149,23 @@ def can_access_folder(user_id: str, folder: dict) -> bool:
     return False
 
 def can_access_asset(user_id: str, asset: dict) -> bool:
+    """Cek apakah user boleh mengakses sebuah aset.
+
+    Aturan akses:
+    - Manager boleh mengakses semua aset.
+    - Uploader selalu boleh mengakses aset miliknya.
+    - Staff boleh mengakses aset yang division_id-nya sama dengan divisinya.
+    - asset_permissions dapat memberi akses tambahan lintas divisi.
+    - asset_shares dapat memberi akses tambahan melalui fitur Shared with me.
+
+    Catatan:
+    is_public TIDAK lagi dipakai sebagai akses global antar-divisi.
+    Field tersebut tetap dibiarkan di database untuk kompatibilitas data lama.
+    """
     if is_manager(user_id):
         return True
+
     if asset.get("user_id") == user_id:
-        return True
-    if asset.get("is_public"):
         return True
 
     ud = get_user_division(user_id)
@@ -161,6 +173,11 @@ def can_access_asset(user_id: str, asset: dict) -> bool:
     if not division_id:
         return False
 
+    # Aset milik divisi user sendiri.
+    if asset.get("division_id") == division_id:
+        return True
+
+    # Permission eksplisit, misalnya Manager menaruh aset ke beberapa divisi.
     permission = supabase.table("asset_permissions").select("id").eq(
         "asset_id", asset["id"]
     ).eq(
@@ -169,11 +186,13 @@ def can_access_asset(user_id: str, asset: dict) -> bool:
     if permission.data:
         return True
 
+    # Share eksplisit ke divisi user.
     share = supabase.table("asset_shares").select("id").eq(
         "asset_id", asset["id"]
     ).eq(
         "to_division_id", division_id
     ).execute()
+
     return bool(share.data)
 
 # ── Auto Tagging ──────────────────────────────────────
@@ -539,9 +558,9 @@ async def upload_asset(
     ud          = get_user_division(user_id)
     division_id = ud["division_id"] if ud else None
 
-    # Manager/admin bisa upload langsung ke folder divisi lain.
-    # Kalau ini terjadi, aset otomatis jadi privat khusus untuk divisi
-    # tujuan itu saja (tidak publik ke semua divisi seperti upload biasa).
+    # Manager/admin bisa upload langsung ke divisi lain.
+    # Semua aset sekarang bersifat terisolasi per divisi.
+    # is_public tidak lagi berarti "terlihat oleh semua divisi".
     is_cross_division = False
     if target_division_id and target_division_id != division_id:
         if not is_manager(user_id):
@@ -556,11 +575,14 @@ async def upload_asset(
         "tipe_file":   file.content_type,
         "ukuran":      ukuran,
         "url":         url_publik,
-        "is_public":   not is_cross_division
+        # Aset tidak lagi otomatis menjadi global/public antar-divisi.
+        "is_public":   False
     }).execute()
 
     asset_id = result.data[0]["id"]
 
+    # Permission eksplisit tetap dibuat untuk upload Manager ke divisi lain.
+    # Untuk upload biasa, division_id pada row assets sudah menjadi sumber akses utama.
     if is_cross_division:
         supabase.table("asset_permissions").insert({
             "asset_id":    asset_id,
@@ -609,40 +631,105 @@ def get_assets(user_id: str):
 
 @app.get("/assets/by-division")
 def get_assets_by_division(user_id: str):
+    """Aset yang tampil di root Gallery.
+
+    Manager:
+      - melihat semua aset.
+
+    Staff:
+      - melihat aset milik divisinya sendiri;
+      - melihat aset yang diberi asset_permissions ke divisinya;
+      - TIDAK otomatis melihat aset divisi lain hanya karena is_public=True;
+      - aset yang dibagikan lewat asset_shares tetap muncul di "Shared with me",
+        bukan dicampur ke root Gallery.
+    """
     ud = get_user_division(user_id)
     if not ud:
         return {"assets": []}
 
     division_id = ud["division_id"]
 
+    # Manager tetap mendapat global view.
     if division_id == MANAGER_ID:
-        result = supabase.table("assets").select("*, users(nama)").order("created_at", desc=True).execute()
+        result = (
+            supabase.table("assets")
+            .select("*, users(nama)")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
         assets = []
-        for a in result.data:
-            item = {**a, "uploader": a.get("users", {}).get("nama", "—") if a.get("users") else "—"}
+        for a in result.data or []:
+            item = {
+                **a,
+                "uploader": (
+                    a.get("users", {}).get("nama", "—")
+                    if a.get("users")
+                    else "—"
+                )
+            }
             item.pop("users", None)
             assets.append(item)
+
         return {"assets": assets}
 
-    public_assets   = supabase.table("assets").select("*, users(nama)").eq("is_public", True).order("created_at", desc=True).execute()
-    perm_result     = supabase.table("asset_permissions").select("asset_id").eq("division_id", division_id).execute()
-    perm_asset_ids  = [p["asset_id"] for p in perm_result.data]
-    share_result    = supabase.table("asset_shares").select("asset_id").eq("to_division_id", division_id).execute()
-    share_asset_ids = [s["asset_id"] for s in share_result.data]
+    # 1) Aset yang memang dimiliki divisi user.
+    own_division_result = (
+        supabase.table("assets")
+        .select("*, users(nama)")
+        .eq("division_id", division_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
 
-    all_ids = set(perm_asset_ids + share_asset_ids)
-    private_assets = []
-    if all_ids:
-        private_result = supabase.table("assets").select("*, users(nama)").in_("id", list(all_ids)).eq("is_public", False).execute()
-        private_assets = private_result.data
+    # 2) Aset tambahan yang secara eksplisit diberi permission ke divisi user.
+    perm_result = (
+        supabase.table("asset_permissions")
+        .select("asset_id")
+        .eq("division_id", division_id)
+        .execute()
+    )
 
-    all_assets = {}
-    for a in public_assets.data + private_assets:
-        item = {**a, "uploader": a.get("users", {}).get("nama", "—") if a.get("users") else "—"}
+    perm_asset_ids = list({
+        row["asset_id"]
+        for row in (perm_result.data or [])
+        if row.get("asset_id")
+    })
+
+    permission_assets = []
+    if perm_asset_ids:
+        permission_result = (
+            supabase.table("assets")
+            .select("*, users(nama)")
+            .in_("id", perm_asset_ids)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        permission_assets = permission_result.data or []
+
+    # Jangan campurkan asset_shares ke sini.
+    # Gallery frontend sudah punya endpoint /assets/shared-to-me khusus.
+    combined = {}
+
+    for a in (own_division_result.data or []) + permission_assets:
+        item = {
+            **a,
+            "uploader": (
+                a.get("users", {}).get("nama", "—")
+                if a.get("users")
+                else "—"
+            )
+        }
         item.pop("users", None)
-        all_assets[item["id"]] = item
+        combined[item["id"]] = item
 
-    return {"assets": list(all_assets.values())}
+    assets = list(combined.values())
+    assets.sort(
+        key=lambda item: item.get("created_at") or "",
+        reverse=True
+    )
+
+    return {"assets": assets}
 
 @app.get("/assets/shared-to-me")
 def get_shared_to_me(user_id: str):
