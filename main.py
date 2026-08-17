@@ -75,6 +75,10 @@ class RuleBatchInput(BaseModel):
     keywords: list
     folder_id: str
 
+class AssignMatchingAssetsInput(BaseModel):
+    user_id: str
+    asset_ids: list
+
 class MoveFolderInput(BaseModel):
     user_id: str
     parent_id: Optional[str] = None
@@ -342,19 +346,13 @@ def get_division_system_folders(division_ids: list) -> list:
         "reason": f'Folder divisi {div_map.get(f["division_id"], "kamu")}'
     } for f in result.data]
 
-def find_matching_smart_folders(tags: list, division_ids: list) -> list:
-    """Smart folder (folder_rules) yang keyword-nya cocok salah satu tag,
-    dibatasi hanya ke folder shared atau folder milik salah satu division_ids.
-
-    parent_id ikut diambil agar hasil prediksi bisa dipangkas ke folder terdalam.
-    """
+def _matching_smart_folders_from_rules(tags: list, division_ids: list, rules: list) -> list:
+    """Hitung Smart Folder yang cocok dari rules yang sudah diambil dari database."""
+    normalized_tags = [str(tag or "").strip().lower() for tag in (tags or []) if str(tag or "").strip()]
     matches = []
-    seen    = set()
-    rules   = supabase.table("folder_rules").select(
-        "*, folders(id, nama, type, division_id, parent_id)"
-    ).execute()
+    seen = set()
 
-    for rule in rules.data or []:
+    for rule in rules or []:
         folder = rule.get("folders")
         if not folder:
             continue
@@ -363,8 +361,11 @@ def find_matching_smart_folders(tags: list, division_ids: list) -> list:
         if not in_scope:
             continue
 
-        keyword     = (rule.get("keyword") or "").lower()
-        matched_tag = next((t for t in tags if keyword in t.lower()), None)
+        keyword = str(rule.get("keyword") or "").strip().lower()
+        if not keyword:
+            continue
+
+        matched_tag = next((tag for tag in normalized_tags if keyword in tag), None)
         if not matched_tag:
             continue
 
@@ -374,15 +375,27 @@ def find_matching_smart_folders(tags: list, division_ids: list) -> list:
 
         seen.add(fid)
         matches.append({
-            "id":          fid,
-            "nama":        folder["nama"],
-            "type":        folder.get("type"),
+            "id": fid,
+            "nama": folder["nama"],
+            "type": folder.get("type"),
             "division_id": folder.get("division_id"),
-            "parent_id":   folder.get("parent_id"),
-            "reason":      f'Cocok kata kunci "{matched_tag}"'
+            "parent_id": folder.get("parent_id"),
+            "reason": f'Cocok kata kunci "{matched_tag}"'
         })
 
     return matches
+
+
+def find_matching_smart_folders(tags: list, division_ids: list) -> list:
+    """Smart folder (folder_rules) yang keyword-nya cocok salah satu tag,
+    dibatasi hanya ke folder shared atau folder milik salah satu division_ids.
+
+    parent_id ikut diambil agar hasil prediksi bisa dipangkas ke folder terdalam.
+    """
+    rules = supabase.table("folder_rules").select(
+        "*, folders(id, nama, type, division_id, parent_id)"
+    ).execute()
+    return _matching_smart_folders_from_rules(tags, division_ids, rules.data or [])
 
 
 def _folder_ancestor_ids(folder_id: str) -> set:
@@ -466,24 +479,109 @@ def predict_folders(tags: list, division_ids: list) -> list:
 
     return _keep_deepest_folder_suggestions(system_folders, smart_folders)
 
-def commit_folder_assignments(asset_id: str, folder_ids: list):
-    """Terapkan daftar folder_id ke asset_folders (idempoten, aman dipanggil ulang)."""
-    for folder_id in folder_ids:
-        already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
-        if not already.data:
-            supabase.table("asset_folders").insert({
-                "asset_id":  asset_id,
-                "folder_id": folder_id
-            }).execute()
+def _system_folder_ids_for_division(division_id: str) -> set:
+    if not division_id:
+        return set()
+    result = supabase.table("folders").select("id").eq(
+        "division_id", division_id
+    ).eq("type", "system").execute()
+    return {row["id"] for row in (result.data or []) if row.get("id")}
+
+
+def _prune_ancestor_assignments(asset_id: str, target_folder_ids: list):
+    """Saat aset masuk ke Smart Folder yang lebih spesifik, hapus assignment parent/root.
+
+    Sibling folder tidak disentuh. Ini mencegah aset tampil ganda di Folder Divisi
+    sekaligus di Smart Folder child setelah backfill atau penambahan tag manual.
+    """
+    target_ids = {folder_id for folder_id in (target_folder_ids or []) if folder_id}
+    removable = set()
+
+    for folder_id in target_ids:
+        folder = _get_folder(folder_id)
+        if not folder or folder.get("type") != "smart":
+            continue
+
+        removable.update(_folder_ancestor_ids(folder_id))
+
+        # Smart Folder legacy bisa belum punya parent_id meski memiliki division_id.
+        if not folder.get("parent_id") and folder.get("division_id"):
+            removable.update(_system_folder_ids_for_division(folder.get("division_id")))
+
+    removable.difference_update(target_ids)
+    if removable:
+        supabase.table("asset_folders").delete().eq(
+            "asset_id", asset_id
+        ).in_("folder_id", list(removable)).execute()
+
+
+def commit_folder_assignments(asset_id: str, folder_ids: list, prune_ancestors: bool = False) -> list:
+    """Terapkan daftar folder_id ke asset_folders secara idempoten.
+
+    Return berisi folder_id yang benar-benar baru ditambahkan.
+    """
+    unique_ids = list(dict.fromkeys([folder_id for folder_id in (folder_ids or []) if folder_id]))
+
+    if prune_ancestors and unique_ids:
+        _prune_ancestor_assignments(asset_id, unique_ids)
+
+    added = []
+    for folder_id in unique_ids:
+        already = supabase.table("asset_folders").select("id").eq(
+            "asset_id", asset_id
+        ).eq("folder_id", folder_id).execute()
+        if already.data:
+            continue
+
+        supabase.table("asset_folders").insert({
+            "asset_id": asset_id,
+            "folder_id": folder_id
+        }).execute()
+        added.append(folder_id)
+
+    return added
+
 
 def auto_assign_folder(asset_id: str, tags: list, division_id: str = None) -> list:
-    """Prediksi folder tujuan dari auto-tagging, langsung terapkan sebagai default
-    (perilaku sama seperti sebelumnya), lalu kembalikan daftarnya supaya frontend
-    bisa menampilkan & memberi opsi cancel per folder ke user."""
+    """Prediksi folder tujuan dari tag dan langsung terapkan sebagai default."""
     division_ids = [division_id] if division_id else []
-    suggestions  = predict_folders(tags, division_ids)
-    commit_folder_assignments(asset_id, [s["id"] for s in suggestions])
+    suggestions = predict_folders(tags, division_ids)
+    commit_folder_assignments(
+        asset_id,
+        [suggestion["id"] for suggestion in suggestions],
+        prune_ancestors=True
+    )
     return suggestions
+
+
+def auto_assign_asset_from_current_tags(asset_id: str) -> list:
+    """Evaluasi ulang sebuah aset setelah tag manual ditambahkan.
+
+    Hanya Smart Folder yang benar-benar baru ditambahkan yang dikembalikan supaya
+    frontend dapat memberi feedback yang relevan kepada user.
+    """
+    asset_result = supabase.table("assets").select("id, division_id").eq("id", asset_id).execute()
+    if not asset_result.data:
+        return []
+
+    asset = asset_result.data[0]
+    division_id = asset.get("division_id")
+    if not division_id:
+        return []
+
+    tags = get_asset_tag_names(asset_id)
+    suggestions = predict_folders(tags, [division_id])
+    added_ids = set(commit_folder_assignments(
+        asset_id,
+        [suggestion["id"] for suggestion in suggestions],
+        prune_ancestors=True
+    ))
+
+    return [
+        suggestion
+        for suggestion in suggestions
+        if suggestion.get("type") == "smart" and suggestion.get("id") in added_ids
+    ]
 
 # ── Root ─────────────────────────────────────────────
 @app.get("/")
@@ -973,9 +1071,26 @@ def tambah_tag(asset_id: str, data: TagInput):
             "detail":   {"tags": added, "count": len(added), "sumber": data.sumber}
         }).execute()
 
+    assigned_folders = []
+    if added:
+        try:
+            assigned_folders = auto_assign_asset_from_current_tags(asset_id)
+        except Exception as assign_error:
+            # Tag tetap dianggap berhasil meskipun evaluasi Smart Folder gagal.
+            print(f"Gagal auto-assign setelah tambah tag asset_id={asset_id}: {assign_error}")
+
     if not added:
-        return {"message": "Semua tag sudah ada sebelumnya", "added": []}
-    return {"message": f"{len(added)} tag ditambahkan", "added": added}
+        return {
+            "message": "Semua tag sudah ada sebelumnya",
+            "added": [],
+            "assigned_folders": []
+        }
+
+    return {
+        "message": f"{len(added)} tag ditambahkan",
+        "added": added,
+        "assigned_folders": assigned_folders
+    }
 
 @app.delete("/assets/{asset_id}/tags/{nama_tag}")
 def hapus_tag(asset_id: str, nama_tag: str, user_id: Optional[str] = None):
@@ -1649,6 +1764,189 @@ def get_folder_access(folder_id: str):
 def hapus_folder_access(folder_id: str, user_id: str):
     supabase.table("folder_access").delete().eq("folder_id", folder_id).eq("user_id", user_id).execute()
     return {"message": "Akses dicabut"}
+
+
+def _folder_primary_scope_divisions(folder: dict) -> list:
+    """Divisi sumber aset untuk Smart Folder.
+
+    Akses share ke divisi lain tidak membuat Smart Folder menarik aset dari divisi
+    penerima share. Karena itu division_id utama diprioritaskan.
+    """
+    if folder.get("division_id"):
+        return [folder["division_id"]]
+    return _folder_divisions(folder)
+
+
+def _folder_descendant_ids(folder_id: str) -> set:
+    descendants = set()
+    queue = [folder_id]
+
+    while queue:
+        parent_id = queue.pop(0)
+        result = supabase.table("folders").select("id").eq("parent_id", parent_id).execute()
+        for row in (result.data or []):
+            child_id = row.get("id")
+            if child_id and child_id not in descendants:
+                descendants.add(child_id)
+                queue.append(child_id)
+
+    return descendants
+
+
+def _matching_assets_for_smart_folder(folder: dict, user_id: str) -> dict:
+    """Preview aset lama yang cocok dengan rules Smart Folder, tanpa memasukkannya."""
+    _assert_folder_manageable(user_id, folder)
+
+    rule_result = supabase.table("folder_rules").select("keyword").eq(
+        "folder_id", folder["id"]
+    ).execute()
+    keywords = list(dict.fromkeys([
+        str(row.get("keyword") or "").strip().lower()
+        for row in (rule_result.data or [])
+        if str(row.get("keyword") or "").strip()
+    ]))
+
+    if not keywords:
+        return {
+            "assets": [],
+            "keywords": [],
+            "already_assigned_count": 0,
+            "scanned_count": 0
+        }
+
+    scope_divisions = _folder_primary_scope_divisions(folder)
+    if not scope_divisions:
+        return {
+            "assets": [],
+            "keywords": keywords,
+            "already_assigned_count": 0,
+            "scanned_count": 0
+        }
+
+    asset_result = supabase.table("assets").select(
+        "*, users(nama)"
+    ).in_("division_id", scope_divisions).order("created_at", desc=True).execute()
+
+    scoped_assets = [
+        asset
+        for asset in (asset_result.data or [])
+        if can_access_asset(user_id, asset)
+    ]
+
+    if not scoped_assets:
+        return {
+            "assets": [],
+            "keywords": keywords,
+            "already_assigned_count": 0,
+            "scanned_count": 0
+        }
+
+    asset_ids = [asset["id"] for asset in scoped_assets]
+    tag_result = supabase.table("asset_tags").select(
+        "asset_id, sumber, tags(nama)"
+    ).in_("asset_id", asset_ids).execute()
+
+    tags_by_asset = {asset_id: [] for asset_id in asset_ids}
+    for row in (tag_result.data or []):
+        tag_data = row.get("tags") or {}
+        tag_name = str(tag_data.get("nama") or "").strip().lower()
+        if not tag_name:
+            continue
+        tags_by_asset.setdefault(row.get("asset_id"), []).append({
+            "nama": tag_name,
+            "sumber": row.get("sumber") or ""
+        })
+
+    hierarchy_ids = {folder["id"]} | _folder_descendant_ids(folder["id"])
+    assigned_result = supabase.table("asset_folders").select(
+        "asset_id, folder_id"
+    ).in_("folder_id", list(hierarchy_ids)).execute()
+    hierarchy_asset_ids = {
+        row.get("asset_id")
+        for row in (assigned_result.data or [])
+        if row.get("asset_id")
+    }
+
+    candidates = []
+    already_assigned_count = 0
+
+    for asset in scoped_assets:
+        tags = tags_by_asset.get(asset["id"], [])
+        matched_tags = sorted({
+            tag["nama"]
+            for tag in tags
+            if any(keyword in tag["nama"] for keyword in keywords)
+        })
+        if not matched_tags:
+            continue
+
+        matched_rules = sorted({
+            keyword
+            for keyword in keywords
+            if any(keyword in tag["nama"] for tag in tags)
+        })
+
+        if asset["id"] in hierarchy_asset_ids:
+            already_assigned_count += 1
+            continue
+
+        uploader_data = asset.get("users") or {}
+        item = {**asset}
+        item.pop("users", None)
+        item["uploader"] = uploader_data.get("nama", "—")
+        item["matching_tags"] = matched_tags
+        item["matching_rules"] = matched_rules
+        candidates.append(item)
+
+    return {
+        "assets": candidates,
+        "keywords": keywords,
+        "already_assigned_count": already_assigned_count,
+        "scanned_count": len(scoped_assets)
+    }
+
+
+@app.get("/folders/{folder_id}/matching-assets")
+def get_folder_matching_assets(folder_id: str, user_id: str):
+    folder = _get_folder(folder_id)
+    return _matching_assets_for_smart_folder(folder, user_id)
+
+
+@app.post("/folders/{folder_id}/assign-matching-assets")
+def assign_matching_assets(folder_id: str, data: AssignMatchingAssetsInput):
+    folder = _get_folder(folder_id)
+    preview = _matching_assets_for_smart_folder(folder, data.user_id)
+
+    allowed = {
+        asset["id"]: asset
+        for asset in preview.get("assets", [])
+    }
+    requested_ids = list(dict.fromkeys([
+        str(asset_id)
+        for asset_id in (data.asset_ids or [])
+        if asset_id
+    ]))
+
+    valid_ids = [asset_id for asset_id in requested_ids if asset_id in allowed]
+    skipped_ids = [asset_id for asset_id in requested_ids if asset_id not in allowed]
+
+    assigned_ids = []
+    for asset_id in valid_ids:
+        added = commit_folder_assignments(
+            asset_id,
+            [folder_id],
+            prune_ancestors=True
+        )
+        if folder_id in added:
+            assigned_ids.append(asset_id)
+
+    return {
+        "message": f"{len(assigned_ids)} aset dimasukkan ke Smart Folder",
+        "assigned_asset_ids": assigned_ids,
+        "assigned_count": len(assigned_ids),
+        "skipped_asset_ids": skipped_ids,
+        "skipped_count": len(skipped_ids)
+    }
 
 
 @app.post("/folders/rules")
