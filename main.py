@@ -1109,15 +1109,96 @@ def top_tags(user_id: str, limit: int = 7):
 # ── Search ───────────────────────────────────────────
 @app.get("/search/by-tag")
 def get_assets_by_tag(user_id: str, tag: str):
-    tag_result = supabase.table("tags").select("id").eq("nama", tag).execute()
+    """Filter tag exact yang mengikuti permission Gallery, bukan hanya uploader."""
+    tag_name = (tag or "").strip().lower()
+    if not tag_name:
+        return {"asset_ids": []}
+
+    tag_result = supabase.table("tags").select("id").eq("nama", tag_name).execute()
     if not tag_result.data:
         return {"asset_ids": []}
+
     tag_id = tag_result.data[0]["id"]
-    assets = supabase.table("assets").select("id").eq("user_id", user_id).execute()
-    user_asset_ids = [a["id"] for a in assets.data]
-    at_result = supabase.table("asset_tags").select("asset_id").eq("tag_id", tag_id).in_("asset_id", user_asset_ids).execute()
-    asset_ids = [at["asset_id"] for at in at_result.data]
-    return {"asset_ids": asset_ids}
+    at_result = supabase.table("asset_tags").select("asset_id").eq("tag_id", tag_id).execute()
+    candidate_ids = list({
+        row["asset_id"]
+        for row in (at_result.data or [])
+        if row.get("asset_id")
+    })
+
+    if not candidate_ids:
+        return {"asset_ids": []}
+
+    asset_result = supabase.table("assets").select("*").in_("id", candidate_ids).execute()
+
+    allowed_ids = [
+        asset["id"]
+        for asset in (asset_result.data or [])
+        if can_access_asset(user_id, asset)
+    ]
+
+    return {"asset_ids": allowed_ids}
+
+
+@app.get("/search/gallery")
+def search_gallery_tags(user_id: str, q: str):
+    """Cari tag secara partial untuk search bar Gallery.
+
+    Endpoint ini hanya mengembalikan ID aset yang tag-nya cocok dan user memang
+    boleh akses. Frontend tetap menggabungkan hasil ini dengan pencarian nama
+    file/folder dan membatasi hasil ke lokasi Gallery yang sedang dibuka.
+    """
+    query = (q or "").strip().lower()
+    if not query:
+        return {"asset_ids": []}
+
+    # Partial match, contoh "file" akan cocok dengan "file-besar".
+    tag_result = (
+        supabase.table("tags")
+        .select("id, nama")
+        .ilike("nama", f"%{query}%")
+        .execute()
+    )
+
+    tag_ids = [
+        row["id"]
+        for row in (tag_result.data or [])
+        if row.get("id")
+    ]
+
+    if not tag_ids:
+        return {"asset_ids": []}
+
+    at_result = (
+        supabase.table("asset_tags")
+        .select("asset_id")
+        .in_("tag_id", tag_ids)
+        .execute()
+    )
+
+    candidate_ids = list({
+        row["asset_id"]
+        for row in (at_result.data or [])
+        if row.get("asset_id")
+    })
+
+    if not candidate_ids:
+        return {"asset_ids": []}
+
+    asset_result = (
+        supabase.table("assets")
+        .select("*")
+        .in_("id", candidate_ids)
+        .execute()
+    )
+
+    allowed_ids = [
+        asset["id"]
+        for asset in (asset_result.data or [])
+        if can_access_asset(user_id, asset)
+    ]
+
+    return {"asset_ids": allowed_ids}
 
 # ── Stats ────────────────────────────────────────────
 @app.get("/stats/tagging")
