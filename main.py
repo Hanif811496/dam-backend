@@ -70,6 +70,9 @@ class RuleInput(BaseModel):
     keyword: str
     folder_id: str
 
+class PredictFoldersInput(BaseModel):
+    division_ids: list
+
 class ShareInput(BaseModel):
     asset_id: str
     from_user_id: str
@@ -258,37 +261,86 @@ def simpan_tags(asset_id: str, tags: list, sumber: str):
             "sumber":   sumber
         }).execute()
 
-def auto_assign_folder(asset_id: str, user_id: str, tags: list, division_id: str = None):
-    # 1. Auto masukkan ke folder system divisi uploader
-    if division_id:
-        div_folder = supabase.table("folders").select("id").eq("division_id", division_id).eq("type", "system").execute()
-        if div_folder.data:
-            folder_id = div_folder.data[0]["id"]
-            already   = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
-            if not already.data:
-                supabase.table("asset_folders").insert({
-                    "asset_id":  asset_id,
-                    "folder_id": folder_id
-                }).execute()
+def get_asset_tag_names(asset_id: str) -> list:
+    """Ambil semua nama tag yang sudah tersimpan untuk satu aset."""
+    result = supabase.table("asset_tags").select("tags(nama)").eq("asset_id", asset_id).execute()
+    return [r["tags"]["nama"] for r in result.data if r.get("tags")]
 
-    # 2. Auto assign berdasarkan smart folder rules
-    rules = supabase.table("folder_rules").select("*, folders(nama, type, division_id)").execute()
-    if not rules.data:
-        return
-    for rule in rules.data:
-        keyword = rule["keyword"].lower()
-        folder  = rule.get("folders", {})
+def get_division_system_folders(division_ids: list) -> list:
+    """Folder system bawaan tiap divisi di daftar division_ids."""
+    if not division_ids:
+        return []
+    result = supabase.table("folders").select("id, nama, division_id").in_("division_id", division_ids).eq("type", "system").execute()
+    if not result.data:
+        return []
+    div_rows = supabase.table("divisions").select("id, nama").in_("id", division_ids).execute()
+    div_map  = {d["id"]: d["nama"] for d in div_rows.data}
+    return [{
+        "id":     f["id"],
+        "nama":   f["nama"],
+        "type":   "system",
+        "reason": f'Folder divisi {div_map.get(f["division_id"], "kamu")}'
+    } for f in result.data]
+
+def find_matching_smart_folders(tags: list, division_ids: list) -> list:
+    """Smart folder (folder_rules) yang keyword-nya cocok salah satu tag,
+    dibatasi hanya ke folder shared atau folder milik salah satu division_ids
+    (supaya file staf satu divisi tidak nyasar otomatis ke folder divisi lain)."""
+    matches = []
+    seen    = set()
+    rules   = supabase.table("folder_rules").select("*, folders(id, nama, type, division_id)").execute()
+    for rule in rules.data or []:
+        folder = rule.get("folders")
         if not folder:
             continue
-        for tag in tags:
-            if keyword in tag.lower():
-                already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", rule["folder_id"]).execute()
-                if not already.data:
-                    supabase.table("asset_folders").insert({
-                        "asset_id":  asset_id,
-                        "folder_id": rule["folder_id"]
-                    }).execute()
-                break
+        in_scope = folder.get("type") == "shared" or folder.get("division_id") in division_ids
+        if not in_scope:
+            continue
+        keyword     = (rule.get("keyword") or "").lower()
+        matched_tag = next((t for t in tags if keyword in t.lower()), None)
+        if not matched_tag:
+            continue
+        fid = folder["id"]
+        if fid in seen:
+            continue
+        seen.add(fid)
+        matches.append({
+            "id":     fid,
+            "nama":   folder["nama"],
+            "type":   folder.get("type"),
+            "reason": f'Cocok kata kunci "{matched_tag}"'
+        })
+    return matches
+
+def predict_folders(tags: list, division_ids: list) -> list:
+    """Hitung daftar folder yang relevan untuk aset ini berdasarkan auto-tagging,
+    tanpa langsung menyimpan apa pun (murni prediksi/preview)."""
+    suggestions = get_division_system_folders(division_ids)
+    seen        = {s["id"] for s in suggestions}
+    for m in find_matching_smart_folders(tags, division_ids):
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            suggestions.append(m)
+    return suggestions
+
+def commit_folder_assignments(asset_id: str, folder_ids: list):
+    """Terapkan daftar folder_id ke asset_folders (idempoten, aman dipanggil ulang)."""
+    for folder_id in folder_ids:
+        already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
+        if not already.data:
+            supabase.table("asset_folders").insert({
+                "asset_id":  asset_id,
+                "folder_id": folder_id
+            }).execute()
+
+def auto_assign_folder(asset_id: str, tags: list, division_id: str = None) -> list:
+    """Prediksi folder tujuan dari auto-tagging, langsung terapkan sebagai default
+    (perilaku sama seperti sebelumnya), lalu kembalikan daftarnya supaya frontend
+    bisa menampilkan & memberi opsi cancel per folder ke user."""
+    division_ids = [division_id] if division_id else []
+    suggestions  = predict_folders(tags, division_ids)
+    commit_folder_assignments(asset_id, [s["id"] for s in suggestions])
+    return suggestions
 
 # ── Root ─────────────────────────────────────────────
 @app.get("/")
@@ -403,14 +455,23 @@ async def upload_asset(
         simpan_tags(asset_id, tags_ai, "ai")
 
     semua_tags = tags_nama + tags_tipe + tags_ai
-    auto_assign_folder(asset_id, user_id, semua_tags, division_id)
+    suggested_folders = auto_assign_folder(asset_id, semua_tags, division_id)
 
     return {
         "message": "Upload berhasil",
         "asset":   result.data[0],
         "tags":    list(set(semua_tags)),
-        "tags_ai": tags_ai
+        "tags_ai": tags_ai,
+        "suggested_folders": suggested_folders
     }
+
+@app.post("/assets/{asset_id}/predict-folders")
+def predict_folders_endpoint(asset_id: str, data: PredictFoldersInput):
+    """Dipakai saat Manager upload ke beberapa divisi sekaligus: hitung folder
+    yang relevan (folder system + smart folder yang cocok tag) untuk divisi-divisi
+    tambahan itu, supaya bisa ditampilkan & dipilih di UI seperti divisi utama."""
+    tags = get_asset_tag_names(asset_id)
+    return {"suggested_folders": predict_folders(tags, data.division_ids)}
 
 @app.get("/assets")
 def get_assets(user_id: str):
