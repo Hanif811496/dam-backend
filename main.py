@@ -38,6 +38,7 @@ class LoginInput(BaseModel):
 class TagInput(BaseModel):
     nama_tag: str
     sumber: str
+    user_id: Optional[str] = None
 
 class FolderInput(BaseModel):
     nama: str
@@ -482,8 +483,12 @@ def get_asset_detail(asset_id: str):
     else:
         a["uploader_divisi"] = "—"
 
-    asset_tags = supabase.table("asset_tags").select("*, tags(nama)").eq("asset_id", asset_id).execute()
-    tags = [{"nama": at["tags"]["nama"], "sumber": at["sumber"]} for at in asset_tags.data]
+    asset_tags = supabase.table("asset_tags").select("*, tags(nama), users(nama)").eq("asset_id", asset_id).execute()
+    tags = [{
+        "nama":      at["tags"]["nama"],
+        "sumber":    at["sumber"],
+        "added_by":  at.get("users", {}).get("nama") if at.get("users") else None
+    } for at in asset_tags.data]
     return {"asset": a, "tags": tags}
 
 @app.delete("/assets/{asset_id}")
@@ -511,9 +516,10 @@ def tambah_tag(asset_id: str, data: TagInput):
     if already.data:
         return {"message": "Tag sudah ada"}
     supabase.table("asset_tags").insert({
-        "asset_id": asset_id,
-        "tag_id":   tag_id,
-        "sumber":   data.sumber
+        "asset_id":   asset_id,
+        "tag_id":     tag_id,
+        "sumber":     data.sumber,
+        "created_by": data.user_id
     }).execute()
     return {"message": "Tag ditambahkan"}
 
