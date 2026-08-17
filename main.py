@@ -41,6 +41,10 @@ class TagInput(BaseModel):
     sumber: str
     user_id: Optional[str] = None
 
+class DownloadLogInput(BaseModel):
+    asset_id: str
+    user_id: str
+
 class FolderInput(BaseModel):
     nama: str
     parent_id: Optional[str] = None
@@ -221,6 +225,21 @@ def tag_dari_imagga(url_gambar: str) -> list:
         print(f"Imagga categories error: {e}")
 
     return tags
+
+def log_activity(type_: str, user_id: str, asset_id: str = None, detail: dict = None):
+    """Catat satu baris activity_log. Dibungkus try/except supaya kalau gagal
+    (mis. koneksi putus), aksi utamanya (hapus/pindah/dsb) tetap jalan."""
+    if not user_id:
+        return
+    try:
+        supabase.table("activity_log").insert({
+            "type":     type_,
+            "user_id":  user_id,
+            "asset_id": asset_id,
+            "detail":   detail or {}
+        }).execute()
+    except Exception as e:
+        print(f"Gagal mencatat activity log ({type_}): {e}")
 
 def simpan_tags(asset_id: str, tags: list, sumber: str):
     for nama_tag in tags:
@@ -527,13 +546,32 @@ def get_asset_detail(asset_id: str):
     } for at in asset_tags.data]
     return {"asset": a, "tags": tags}
 
+@app.post("/assets/{asset_id}/log-download")
+def log_download(asset_id: str, data: DownloadLogInput):
+    asset = supabase.table("assets").select("nama_file").eq("id", asset_id).execute()
+    nama_file = asset.data[0]["nama_file"] if asset.data else "—"
+    log_activity("download", data.user_id, asset_id=asset_id, detail={"nama_file": nama_file})
+    return {"message": "Download dicatat"}
+
 @app.delete("/assets/{asset_id}")
-def delete_asset(asset_id: str):
-    asset = supabase.table("assets").select("*").eq("id", asset_id).execute()
+def delete_asset(asset_id: str, user_id: Optional[str] = None):
+    asset = supabase.table("assets").select("*, divisions(nama)").eq("id", asset_id).execute()
     if not asset.data:
         raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
-    url  = asset.data[0]["url"]
+    a    = asset.data[0]
+    url  = a["url"]
     path = url.split("/object/public/assets/")[1]
+
+    # Log dulu sebelum row-nya benar-benar dihapus. asset_id sengaja tidak
+    # diisi (None) supaya baris log ini tidak ikut kehapus lewat cascade
+    # kalau ada foreign key on-delete-cascade dari activity_log ke assets.
+    log_activity("delete", user_id, asset_id=None, detail={
+        "nama_file": a["nama_file"],
+        "tipe_file": a.get("tipe_file"),
+        "ukuran":    a.get("ukuran"),
+        "divisi":    a.get("divisions", {}).get("nama") if a.get("divisions") else None
+    })
+
     supabase.storage.from_("assets").remove([path])
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).execute()
     supabase.table("asset_folders").delete().eq("asset_id", asset_id).execute()
@@ -591,12 +629,13 @@ def tambah_tag(asset_id: str, data: TagInput):
     return {"message": f"{len(added)} tag ditambahkan", "added": added}
 
 @app.delete("/assets/{asset_id}/tags/{nama_tag}")
-def hapus_tag(asset_id: str, nama_tag: str):
+def hapus_tag(asset_id: str, nama_tag: str, user_id: Optional[str] = None):
     tag = supabase.table("tags").select("id").eq("nama", nama_tag).execute()
     if not tag.data:
         raise HTTPException(status_code=404, detail="Tag tidak ditemukan")
     tag_id = tag.data[0]["id"]
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).eq("tag_id", tag_id).execute()
+    log_activity("tag_removed", user_id, asset_id=asset_id, detail={"tag": nama_tag})
     return {"message": "Tag dihapus"}
 
 @app.post("/folders/{folder_id}/add-asset")
@@ -624,6 +663,14 @@ def remove_asset_from_folder(folder_id: str, asset_id: str, user_id: str):
     if not can_access_folder(user_id, f):
         raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
     supabase.table("asset_folders").delete().eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
+
+    asset = supabase.table("assets").select("nama_file").eq("id", asset_id).execute()
+    nama_file = asset.data[0]["nama_file"] if asset.data else "—"
+    log_activity("remove_from_folder", user_id, asset_id=asset_id, detail={
+        "nama_file": nama_file,
+        "folder":    f.get("nama")
+    })
+
     return {"message": "Aset dikeluarkan dari folder"}
 
 @app.post("/assets/{asset_id}/move-folder")
@@ -634,11 +681,13 @@ def move_asset_to_folder(asset_id: str, data: MoveAssetInput):
     if not can_access_folder(data.user_id, target.data[0]):
         raise HTTPException(status_code=403, detail="Tidak punya akses ke folder tujuan")
 
+    from_folder_nama = None
     if data.from_folder_id and data.from_folder_id != data.to_folder_id:
         source = supabase.table("folders").select("*").eq("id", data.from_folder_id).execute()
         if source.data:
             if not can_access_folder(data.user_id, source.data[0]):
                 raise HTTPException(status_code=403, detail="Tidak punya akses ke folder asal")
+            from_folder_nama = source.data[0].get("nama")
         supabase.table("asset_folders").delete().eq("asset_id", asset_id).eq("folder_id", data.from_folder_id).execute()
 
     already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", data.to_folder_id).execute()
@@ -647,6 +696,14 @@ def move_asset_to_folder(asset_id: str, data: MoveAssetInput):
             "asset_id":  asset_id,
             "folder_id": data.to_folder_id
         }).execute()
+
+    asset = supabase.table("assets").select("nama_file").eq("id", asset_id).execute()
+    nama_file = asset.data[0]["nama_file"] if asset.data else "—"
+    log_activity("move", data.user_id, asset_id=asset_id, detail={
+        "nama_file":   nama_file,
+        "to_folder":   target.data[0].get("nama"),
+        "from_folder": from_folder_nama
+    })
 
     return {"message": "Aset dipindahkan ke folder baru"}
 
@@ -1031,53 +1088,112 @@ def hapus_user(user_id: str):
     return {"message": "Akun berhasil dihapus"}
 
 @app.get("/admin/activity")
-def get_activity(limit: int = 30):
+def get_activity(
+    limit: int = 50,
+    type: Optional[str] = None,          # comma-separated: upload,share,tag_added,tag_removed,delete,move,remove_from_folder,download
+    user_id: Optional[str] = None,
+    division_id: Optional[str] = None,
+    date_from: Optional[str] = None,     # format YYYY-MM-DD
+    date_to: Optional[str] = None,       # format YYYY-MM-DD
+    sort: str = "desc"                   # "desc" (terbaru dulu) atau "asc" (terlama dulu)
+):
+    POOL = 500  # ambil pool cukup besar per sumber sebelum difilter/diurutkan di Python
+
     uploads = supabase.table("assets").select(
-        "id, nama_file, tipe_file, ukuran, created_at, users(nama), divisions(nama)"
-    ).order("created_at", desc=True).limit(limit).execute()
+        "id, nama_file, tipe_file, ukuran, created_at, user_id, users(nama), division_id, divisions(nama)"
+    ).order("created_at", desc=True).limit(POOL).execute()
 
     shares = supabase.table("asset_shares").select(
-        "id, catatan, created_at, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
-    ).order("created_at", desc=True).limit(limit).execute()
+        "id, catatan, created_at, from_user_id, to_division_id, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
+    ).order("created_at", desc=True).limit(POOL).execute()
 
-    tag_events = supabase.table("activity_log").select(
-        "id, detail, created_at, users(nama), assets(nama_file, divisions(nama))"
-    ).eq("type", "tag_added").order("created_at", desc=True).limit(limit).execute()
+    log_events = supabase.table("activity_log").select(
+        "id, type, detail, created_at, user_id, users(nama), asset_id, assets(nama_file, division_id, divisions(nama))"
+    ).order("created_at", desc=True).limit(POOL).execute()
 
     activities = []
     for u in uploads.data:
         activities.append({
-            "type":       "upload",
-            "user":       u.get("users", {}).get("nama", "—") if u.get("users") else "—",
-            "division":   u.get("divisions", {}).get("nama", "—") if u.get("divisions") else "—",
-            "file":       u["nama_file"],
-            "tipe":       u["tipe_file"],
-            "ukuran":     u["ukuran"],
-            "created_at": u["created_at"]
+            "type":        "upload",
+            "user":        u.get("users", {}).get("nama", "—") if u.get("users") else "—",
+            "user_id":     u.get("user_id"),
+            "division":    u.get("divisions", {}).get("nama", "—") if u.get("divisions") else "—",
+            "division_id": u.get("division_id"),
+            "file":        u["nama_file"],
+            "tipe":        u["tipe_file"],
+            "ukuran":      u["ukuran"],
+            "created_at":  u["created_at"]
         })
     for s in shares.data:
         activities.append({
-            "type":       "share",
-            "user":       s.get("users", {}).get("nama", "—") if s.get("users") else "—",
-            "division":   s.get("divisions", {}).get("nama", "—") if s.get("divisions") else "—",
-            "file":       s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
-            "catatan":    s.get("catatan", ""),
-            "created_at": s["created_at"]
+            "type":        "share",
+            "user":        s.get("users", {}).get("nama", "—") if s.get("users") else "—",
+            "user_id":     s.get("from_user_id"),
+            "division":    s.get("divisions", {}).get("nama", "—") if s.get("divisions") else "—",
+            "division_id": s.get("to_division_id"),
+            "file":        s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
+            "catatan":     s.get("catatan", ""),
+            "created_at":  s["created_at"]
         })
-    for t in tag_events.data:
-        asset  = t.get("assets") or {}
-        detail = t.get("detail") or {}
-        activities.append({
-            "type":       "tag_added",
-            "user":       t.get("users", {}).get("nama", "—") if t.get("users") else "—",
-            "division":   asset.get("divisions", {}).get("nama", "—") if asset.get("divisions") else "—",
-            "file":       asset.get("nama_file", "—"),
-            "count":      detail.get("count", 0),
-            "tags":       detail.get("tags", []),
-            "created_at": t["created_at"]
-        })
-    activities.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"activities": activities[:limit]}
+    for e in log_events.data:
+        asset       = e.get("assets") or {}
+        detail      = e.get("detail") or {}
+        evt_type    = e.get("type")
+        user_nama   = e.get("users", {}).get("nama", "—") if e.get("users") else "—"
+        # Untuk event "delete", aset sudah tidak ada lagi -> pakai data yang
+        # disimpan di detail saat logging. Untuk event lain, aset masih ada
+        # jadi pakai relasi assets/divisions yang live.
+        if evt_type == "delete":
+            file_nama   = detail.get("nama_file", "—")
+            division    = detail.get("divisi") or "—"
+            division_id_val = None
+        else:
+            file_nama   = asset.get("nama_file", detail.get("nama_file", "—"))
+            division    = asset.get("divisions", {}).get("nama", "—") if asset.get("divisions") else "—"
+            division_id_val = asset.get("division_id")
+
+        item = {
+            "type":        evt_type,
+            "user":        user_nama,
+            "user_id":     e.get("user_id"),
+            "division":    division,
+            "division_id": division_id_val,
+            "file":        file_nama,
+            "created_at":  e["created_at"]
+        }
+        if evt_type == "tag_added":
+            item["count"] = detail.get("count", 0)
+            item["tags"]  = detail.get("tags", [])
+        elif evt_type == "tag_removed":
+            item["tag"] = detail.get("tag", "—")
+        elif evt_type == "move":
+            item["to_folder"]   = detail.get("to_folder")
+            item["from_folder"] = detail.get("from_folder")
+        elif evt_type == "remove_from_folder":
+            item["folder"] = detail.get("folder")
+        elif evt_type == "delete":
+            item["tipe"]   = detail.get("tipe_file")
+            item["ukuran"] = detail.get("ukuran")
+
+        activities.append(item)
+
+    # ── Filter ──────────────────────────────────────────
+    if type:
+        wanted = {t.strip() for t in type.split(",") if t.strip()}
+        activities = [a for a in activities if a["type"] in wanted]
+    if user_id:
+        activities = [a for a in activities if a.get("user_id") == user_id]
+    if division_id:
+        activities = [a for a in activities if a.get("division_id") == division_id]
+    if date_from:
+        activities = [a for a in activities if a["created_at"][:10] >= date_from]
+    if date_to:
+        activities = [a for a in activities if a["created_at"][:10] <= date_to]
+
+    # ── Sort ────────────────────────────────────────────
+    activities.sort(key=lambda x: x["created_at"], reverse=(sort != "asc"))
+
+    return {"activities": activities[:limit], "total": len(activities)}
 
 @app.get("/admin/report/assets")
 def report_assets():
