@@ -79,6 +79,10 @@ class ShareInput(BaseModel):
     to_division_id: str
     catatan: Optional[str] = None
 
+class FolderShareInput(BaseModel):
+    from_user_id: str
+    to_division_id: str
+
 class PermissionInput(BaseModel):
     asset_id: str
     division_ids: list
@@ -134,6 +138,31 @@ def can_access_folder(user_id: str, folder: dict) -> bool:
     if has_folder_access(user_id, folder["id"]):
         return True
     return False
+
+def can_access_asset(user_id: str, asset: dict) -> bool:
+    """Return True kalau user boleh melihat/membagikan asset ini."""
+    if is_manager(user_id):
+        return True
+    if asset.get("user_id") == user_id:
+        return True
+    if asset.get("is_public"):
+        return True
+
+    ud = get_user_division(user_id)
+    division_id = ud["division_id"] if ud else None
+    if not division_id:
+        return False
+
+    permission = supabase.table("asset_permissions").select("id").eq(
+        "asset_id", asset["id"]
+    ).eq("division_id", division_id).execute()
+    if permission.data:
+        return True
+
+    share = supabase.table("asset_shares").select("id").eq(
+        "asset_id", asset["id"]
+    ).eq("to_division_id", division_id).execute()
+    return bool(share.data)
 
 # ── Auto Tagging ──────────────────────────────────────
 def tag_dari_nama_file(nama_file: str) -> list:
@@ -549,14 +578,44 @@ def get_unread_shares(user_id: str):
 
 @app.post("/assets/share")
 def share_asset(data: ShareInput):
-    result = supabase.table("asset_shares").insert({
-        "asset_id":       data.asset_id,
-        "from_user_id":   data.from_user_id,
-        "to_division_id": data.to_division_id,
-        "catatan":        data.catatan,
-        "is_read":        False
-    }).execute()
-    return {"message": "Aset berhasil dibagikan", "share": result.data[0]}
+    asset_result = supabase.table("assets").select("*").eq("id", data.asset_id).execute()
+    if not asset_result.data:
+        raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
+    asset = asset_result.data[0]
+    if not can_access_asset(data.from_user_id, asset):
+        raise HTTPException(status_code=403, detail="Tidak punya izin membagikan aset ini")
+
+    target_division = supabase.table("divisions").select("id, nama").eq("id", data.to_division_id).execute()
+    if not target_division.data:
+        raise HTTPException(status_code=404, detail="Divisi tujuan tidak ditemukan")
+
+    # Kalau aset yang sama dibagikan lagi oleh user yang sama ke divisi yang sama,
+    # update row lama supaya Shared Folder tidak penuh duplikat.
+    existing = supabase.table("asset_shares").select("id").eq(
+        "asset_id", data.asset_id
+    ).eq("from_user_id", data.from_user_id).eq(
+        "to_division_id", data.to_division_id
+    ).execute()
+
+    payload = {
+        "catatan": data.catatan,
+        "is_read": False
+    }
+    if existing.data:
+        result = supabase.table("asset_shares").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        payload.update({
+            "asset_id": data.asset_id,
+            "from_user_id": data.from_user_id,
+            "to_division_id": data.to_division_id
+        })
+        result = supabase.table("asset_shares").insert(payload).execute()
+
+    return {
+        "message": "Aset berhasil dibagikan",
+        "share": result.data[0],
+        "to_division": target_division.data[0]
+    }
 
 @app.put("/assets/share/{share_id}/read")
 def mark_share_read(share_id: str):
@@ -619,7 +678,9 @@ def delete_asset(asset_id: str, user_id: Optional[str] = None):
     asset = supabase.table("assets").select("*, divisions(nama)").eq("id", asset_id).execute()
     if not asset.data:
         raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
-    a    = asset.data[0]
+    a = asset.data[0]
+    if user_id and a.get("user_id") != user_id and not is_manager(user_id):
+        raise HTTPException(status_code=403, detail="Hanya uploader atau Manager yang bisa menghapus aset ini")
     url  = a["url"]
     path = url.split("/object/public/assets/")[1]
 
@@ -636,6 +697,8 @@ def delete_asset(asset_id: str, user_id: Optional[str] = None):
     supabase.storage.from_("assets").remove([path])
     supabase.table("asset_tags").delete().eq("asset_id", asset_id).execute()
     supabase.table("asset_folders").delete().eq("asset_id", asset_id).execute()
+    supabase.table("asset_shares").delete().eq("asset_id", asset_id).execute()
+    supabase.table("asset_permissions").delete().eq("asset_id", asset_id).execute()
     supabase.table("assets").delete().eq("id", asset_id).execute()
     return {"message": "Aset berhasil dihapus"}
 
@@ -944,37 +1007,66 @@ def get_folders(user_id: str):
     ud          = get_user_division(user_id)
     division_id = ud["division_id"] if ud else None
 
+    # Dipakai untuk menampilkan provenance: "Dibagikan oleh ...".
+    access_result = supabase.table("folder_access").select("folder_id, granted_by").eq("user_id", user_id).execute()
+    access_by_folder = {row["folder_id"]: row.get("granted_by") for row in access_result.data}
+
+    div_folder_ids = []
+    if division_id:
+        div_access_result = supabase.table("folder_divisions").select("folder_id").eq("division_id", division_id).execute()
+        div_folder_ids = [d["folder_id"] for d in div_access_result.data]
+
     if division_id == MANAGER_ID:
         result = supabase.table("folders").select("*, users(nama), divisions(nama)").order("type").order("nama").execute()
         folder_rows = result.data
     else:
-        result = supabase.table("folders").select("*, users(nama), divisions(nama)").or_(
-            f"type.eq.shared,and(type.eq.system,division_id.eq.{division_id}),and(type.eq.smart,division_id.eq.{division_id})"
-        ).order("type").order("nama").execute()
-        folder_rows = list(result.data)
+        if division_id:
+            result = supabase.table("folders").select("*, users(nama), divisions(nama)").or_(
+                f"type.eq.shared,and(type.eq.system,division_id.eq.{division_id}),and(type.eq.smart,division_id.eq.{division_id})"
+            ).order("type").order("nama").execute()
+            folder_rows = list(result.data)
+        else:
+            result = supabase.table("folders").select("*, users(nama), divisions(nama)").eq("type", "shared").order("nama").execute()
+            folder_rows = list(result.data)
 
-        access_result = supabase.table("folder_access").select("folder_id").eq("user_id", user_id).execute()
-        shared_folder_ids = [a["folder_id"] for a in access_result.data]
-
-        div_access_result = supabase.table("folder_divisions").select("folder_id").eq("division_id", division_id).execute()
-        div_folder_ids = [d["folder_id"] for d in div_access_result.data]
-
+        shared_folder_ids = list(access_by_folder.keys())
         existing_ids = {f["id"] for f in folder_rows}
         new_ids = [fid for fid in set(shared_folder_ids + div_folder_ids) if fid not in existing_ids]
         if new_ids:
             shared_rows = supabase.table("folders").select("*, users(nama), divisions(nama)").in_("id", new_ids).execute()
-            for f in shared_rows.data:
-                if f["id"] not in shared_folder_ids and f["id"] in div_folder_ids:
-                    # sudah dapat lewat akses divisi (bukan divisi pemilik utama) -> tandai dibagikan
-                    f["shared_to_me"] = True
-                folder_rows.append(f)
+            folder_rows.extend(shared_rows.data)
+
+    # Ambil nama pemberi akses dalam satu query. Untuk share via folder_divisions
+    # lama yang belum punya folder_access, owner folder jadi fallback provenance.
+    granted_by_ids = {uid for uid in access_by_folder.values() if uid}
+    granted_by_map = {}
+    if granted_by_ids:
+        users_result = supabase.table("users").select("id, nama").in_("id", list(granted_by_ids)).execute()
+        granted_by_map = {u["id"]: u["nama"] for u in users_result.data}
 
     folders = []
     for f in folder_rows:
+        owner_name = f.get("users", {}).get("nama", "-") if f.get("users") else "-"
+        shared_via_user = f["id"] in access_by_folder and f.get("user_id") != user_id
+        shared_via_div = (
+            division_id
+            and f["id"] in div_folder_ids
+            and f.get("division_id") != division_id
+            and f.get("user_id") != user_id
+        )
+        shared_to_me = bool(shared_via_user or shared_via_div)
+
+        granted_by_id = access_by_folder.get(f["id"])
+        shared_by = granted_by_map.get(granted_by_id) if granted_by_id else None
+        if shared_to_me and not shared_by:
+            shared_by = owner_name
+
         item = {
             **f,
-            "owner":    f.get("users", {}).get("nama", "—") if f.get("users") else "—",
-            "div_nama": f.get("divisions", {}).get("nama", "") if f.get("divisions") else "",
+            "owner":        owner_name,
+            "div_nama":     f.get("divisions", {}).get("nama", "") if f.get("divisions") else "",
+            "shared_to_me": shared_to_me,
+            "shared_by":    shared_by,
         }
         item.pop("users", None)
         item.pop("divisions", None)
@@ -1010,6 +1102,63 @@ def set_folder_access(folder_id: str, data: FolderAccessInput):
                 "granted_by":  data.granted_by
             }).execute()
     return {"message": "Akses folder diperbarui"}
+
+@app.post("/folders/{folder_id}/share")
+def share_folder_to_division(folder_id: str, data: FolderShareInput):
+    folder_result = supabase.table("folders").select("*").eq("id", folder_id).execute()
+    if not folder_result.data:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    folder = folder_result.data[0]
+
+    # Share folder adalah aksi pemilik folder/Manager, bukan sekadar viewer.
+    if folder.get("user_id") != data.from_user_id and not is_manager(data.from_user_id):
+        raise HTTPException(status_code=403, detail="Hanya pemilik folder atau Manager yang bisa membagikan folder")
+
+    division_result = supabase.table("divisions").select("id, nama").eq("id", data.to_division_id).execute()
+    if not division_result.data:
+        raise HTTPException(status_code=404, detail="Divisi tujuan tidak ditemukan")
+
+    # Simpan akses divisi agar anggota yang masuk ke divisi itu di kemudian hari
+    # tetap bisa melihat folder.
+    existing_div = supabase.table("folder_divisions").select("id").eq(
+        "folder_id", folder_id
+    ).eq("division_id", data.to_division_id).execute()
+    if not existing_div.data:
+        supabase.table("folder_divisions").insert({
+            "folder_id": folder_id,
+            "division_id": data.to_division_id
+        }).execute()
+
+    # Selain akses berbasis divisi, buat/update folder_access untuk anggota saat ini
+    # agar provenance "dibagikan oleh siapa" bisa ditampilkan tanpa tabel baru.
+    target_users = supabase.table("user_divisions").select("user_id").eq(
+        "division_id", data.to_division_id
+    ).execute()
+    shared_count = 0
+    for row in target_users.data:
+        target_user_id = row["user_id"]
+        if target_user_id == data.from_user_id:
+            continue
+        existing_access = supabase.table("folder_access").select("id").eq(
+            "folder_id", folder_id
+        ).eq("user_id", target_user_id).execute()
+        if existing_access.data:
+            supabase.table("folder_access").update({
+                "granted_by": data.from_user_id
+            }).eq("id", existing_access.data[0]["id"]).execute()
+        else:
+            supabase.table("folder_access").insert({
+                "folder_id": folder_id,
+                "user_id": target_user_id,
+                "granted_by": data.from_user_id
+            }).execute()
+        shared_count += 1
+
+    return {
+        "message": "Folder berhasil dibagikan ke divisi",
+        "division": division_result.data[0],
+        "shared_to_users": shared_count
+    }
 
 @app.get("/folders/{folder_id}/access")
 def get_folder_access(folder_id: str):
