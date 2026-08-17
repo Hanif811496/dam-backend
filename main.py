@@ -70,6 +70,15 @@ class RuleInput(BaseModel):
     keyword: str
     folder_id: str
 
+class RuleBatchInput(BaseModel):
+    user_id: str
+    keywords: list
+    folder_id: str
+
+class MoveFolderInput(BaseModel):
+    user_id: str
+    parent_id: Optional[str] = None
+
 class PredictFoldersInput(BaseModel):
     division_ids: list
 
@@ -929,6 +938,59 @@ def stats_tagging(user_id: str):
     }
 
 # ── Folders ──────────────────────────────────────────
+def _get_folder(folder_id: str):
+    result = supabase.table("folders").select("*").eq("id", folder_id).execute()
+    return result.data[0] if result.data else None
+
+
+def _folder_divisions(folder: dict) -> list:
+    """Ambil daftar divisi efektif folder. Folder lama tetap didukung."""
+    if not folder:
+        return []
+    ids = get_folder_division_ids(folder["id"])
+    if not ids and folder.get("division_id"):
+        ids = [folder["division_id"]]
+    return list(dict.fromkeys(ids))
+
+
+def _assert_folder_manageable(user_id: str, folder: dict):
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    if folder.get("type") != "smart":
+        raise HTTPException(status_code=400, detail="Hanya Smart Folder yang bisa diubah")
+    if folder.get("user_id") != user_id and not is_manager(user_id):
+        raise HTTPException(status_code=403, detail="Tidak punya izin mengubah folder ini")
+
+
+def _is_descendant(candidate_parent_id: str, folder_id: str) -> bool:
+    """True jika candidate_parent berada di bawah folder_id (mencegah cycle)."""
+    current_id = candidate_parent_id
+    seen = set()
+    while current_id:
+        if current_id == folder_id:
+            return True
+        if current_id in seen:
+            return True
+        seen.add(current_id)
+        row = _get_folder(current_id)
+        if not row:
+            return False
+        current_id = row.get("parent_id")
+    return False
+
+
+def _set_folder_division_rows(folder_id: str, division_ids: list):
+    division_ids = [d for d in dict.fromkeys(division_ids or []) if d]
+    supabase.table("folder_divisions").delete().eq("folder_id", folder_id).execute()
+    for div_id in division_ids:
+        supabase.table("folder_divisions").insert({
+            "folder_id": folder_id,
+            "division_id": div_id
+        }).execute()
+    if division_ids:
+        supabase.table("folders").update({"division_id": division_ids[0]}).eq("id", folder_id).execute()
+
+
 @app.post("/folders")
 def buat_folder(data: FolderInput):
     payload = {"nama": data.nama, "type": "smart", "user_id": data.user_id}
@@ -937,74 +999,108 @@ def buat_folder(data: FolderInput):
     result = supabase.table("folders").insert(payload).execute()
     return {"message": "Folder dibuat", "folder": result.data[0]}
 
+
 @app.post("/folders/smart")
 def buat_smart_folder(data: FolderInput):
+    nama = (data.nama or "").strip()
+    if not nama:
+        raise HTTPException(status_code=400, detail="Nama folder tidak boleh kosong")
+
     ud = get_user_division(data.user_id)
     if not ud:
         raise HTTPException(status_code=400, detail="User tidak memiliki divisi")
     own_division_id = ud["division_id"]
 
-    # Kumpulkan daftar divisi tujuan: dukung division_ids (baru, multi)
-    # maupun target_division_id (lama, single) untuk kompatibilitas.
-    target_ids = list(data.division_ids) if data.division_ids else []
-    if data.target_division_id and data.target_division_id not in target_ids:
-        target_ids.append(data.target_division_id)
+    parent = None
+    if data.parent_id:
+        parent = _get_folder(data.parent_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="Folder induk tidak ditemukan")
+        if parent.get("type") not in ("system", "smart"):
+            raise HTTPException(status_code=400, detail="Smart Folder hanya bisa diletakkan di Folder Divisi atau Smart Folder")
+        if not can_access_folder(data.user_id, parent):
+            raise HTTPException(status_code=403, detail="Tidak punya akses ke folder induk")
 
-    non_own = [d for d in target_ids if d != own_division_id]
-    if non_own and not is_manager(data.user_id):
-        raise HTTPException(status_code=403, detail="Hanya Manager yang bisa membuat smart folder untuk divisi lain")
+    if parent:
+        # Child mewarisi divisi parent agar hierarchy tidak menghasilkan akses yang bocor.
+        target_ids = _folder_divisions(parent)
+        if not target_ids and parent.get("division_id"):
+            target_ids = [parent["division_id"]]
+    else:
+        target_ids = list(data.division_ids) if data.division_ids else []
+        if data.target_division_id and data.target_division_id not in target_ids:
+            target_ids.append(data.target_division_id)
+        non_own = [d for d in target_ids if d != own_division_id]
+        if non_own and not is_manager(data.user_id):
+            raise HTTPException(status_code=403, detail="Hanya Manager yang bisa membuat Smart Folder untuk divisi lain")
+        if not target_ids:
+            target_ids = [own_division_id]
 
     if not target_ids:
-        target_ids = [own_division_id]
-
-    # division_id (kolom lama) tetap diisi divisi pertama sebagai pemilik utama,
-    # dipakai untuk kompatibilitas & tampilan grup folder.
-    primary_division_id = target_ids[0]
+        raise HTTPException(status_code=400, detail="Folder harus memiliki minimal satu divisi")
 
     result = supabase.table("folders").insert({
-        "nama":        data.nama,
-        "type":        "smart",
-        "division_id": primary_division_id,
-        "user_id":     data.user_id,
-        "parent_id":   data.parent_id
+        "nama": nama,
+        "type": "smart",
+        "division_id": target_ids[0],
+        "user_id": data.user_id,
+        "parent_id": data.parent_id
     }).execute()
     folder = result.data[0]
-
-    for div_id in set(target_ids):
-        supabase.table("folder_divisions").insert({
-            "folder_id":   folder["id"],
-            "division_id": div_id
-        }).execute()
-
+    _set_folder_division_rows(folder["id"], target_ids)
     return {"message": "Smart folder dibuat", "folder": folder}
+
+
+@app.put("/folders/{folder_id}/move")
+def move_folder(folder_id: str, data: MoveFolderInput):
+    folder = _get_folder(folder_id)
+    _assert_folder_manageable(data.user_id, folder)
+
+    target_divisions = _folder_divisions(folder)
+    new_parent = None
+    if data.parent_id:
+        if data.parent_id == folder_id:
+            raise HTTPException(status_code=400, detail="Folder tidak bisa dipindahkan ke dirinya sendiri")
+        if _is_descendant(data.parent_id, folder_id):
+            raise HTTPException(status_code=400, detail="Folder tidak bisa dipindahkan ke subfoldernya sendiri")
+        new_parent = _get_folder(data.parent_id)
+        if not new_parent:
+            raise HTTPException(status_code=404, detail="Folder tujuan tidak ditemukan")
+        if new_parent.get("type") not in ("system", "smart"):
+            raise HTTPException(status_code=400, detail="Tujuan harus Folder Divisi atau Smart Folder")
+        if not can_access_folder(data.user_id, new_parent):
+            raise HTTPException(status_code=403, detail="Tidak punya akses ke folder tujuan")
+        target_divisions = _folder_divisions(new_parent)
+
+    supabase.table("folders").update({"parent_id": data.parent_id}).eq("id", folder_id).execute()
+    if target_divisions:
+        _set_folder_division_rows(folder_id, target_divisions)
+    return {"message": "Folder berhasil dipindahkan"}
+
 
 @app.post("/folders/{folder_id}/divisions")
 def set_folder_divisions(folder_id: str, data: FolderDivisionInput):
-    folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
-    if not folder.data:
-        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
-    f = folder.data[0]
-    if not (is_manager(data.granted_by) or f.get("user_id") == data.granted_by):
-        raise HTTPException(status_code=403, detail="Tidak punya izin mengatur akses divisi folder ini")
+    folder = _get_folder(folder_id)
+    _assert_folder_manageable(data.granted_by, folder)
+    if folder.get("parent_id"):
+        raise HTTPException(status_code=400, detail="Akses child Smart Folder mengikuti folder induknya")
     if not data.division_ids:
         raise HTTPException(status_code=400, detail="Pilih minimal satu divisi")
-
-    supabase.table("folder_divisions").delete().eq("folder_id", folder_id).execute()
-    for div_id in set(data.division_ids):
-        supabase.table("folder_divisions").insert({
-            "folder_id":   folder_id,
-            "division_id": div_id
-        }).execute()
-
-    # Divisi pertama tetap dipakai sebagai "pemilik utama" (kolom division_id lama)
-    supabase.table("folders").update({"division_id": data.division_ids[0]}).eq("id", folder_id).execute()
+    if not is_manager(data.granted_by):
+        ud = get_user_division(data.granted_by)
+        own = ud["division_id"] if ud else None
+        if any(d != own for d in data.division_ids):
+            raise HTTPException(status_code=403, detail="Hanya Manager yang bisa memberi akses lintas divisi")
+    _set_folder_division_rows(folder_id, data.division_ids)
     return {"message": "Akses divisi folder diperbarui"}
+
 
 @app.get("/folders/{folder_id}/divisions")
 def get_folder_divisions_endpoint(folder_id: str):
     result = supabase.table("folder_divisions").select("*, divisions(id, nama)").eq("folder_id", folder_id).execute()
     divisions = [r["divisions"] for r in result.data if r.get("divisions")]
     return {"divisions": divisions}
+
 
 @app.get("/folders")
 def get_folders(user_id: str):
@@ -1014,10 +1110,7 @@ def get_folders(user_id: str):
     access_result = supabase.table("folder_access").select(
         "folder_id, granted_by"
     ).eq("user_id", user_id).execute()
-    access_by_folder = {
-        row["folder_id"]: row.get("granted_by")
-        for row in access_result.data
-    }
+    access_by_folder = {row["folder_id"]: row.get("granted_by") for row in access_result.data}
 
     div_folder_ids = []
     if division_id:
@@ -1047,49 +1140,31 @@ def get_folders(user_id: str):
 
         existing_ids = {folder["id"] for folder in folder_rows}
         extra_ids = [
-            folder_id
-            for folder_id in set(list(access_by_folder.keys()) + div_folder_ids)
-            if folder_id not in existing_ids
+            fid for fid in set(list(access_by_folder.keys()) + div_folder_ids)
+            if fid not in existing_ids
         ]
-
         if extra_ids:
             shared_rows = supabase.table("folders").select(
                 "*, users(nama), divisions(nama)"
             ).in_("id", extra_ids).execute()
             folder_rows.extend(shared_rows.data)
 
-    granted_by_ids = {
-        granted_by
-        for granted_by in access_by_folder.values()
-        if granted_by
-    }
+    granted_by_ids = {uid for uid in access_by_folder.values() if uid}
     granted_by_map = {}
     if granted_by_ids:
-        users_result = supabase.table("users").select("id, nama").in_(
-            "id", list(granted_by_ids)
-        ).execute()
+        users_result = supabase.table("users").select("id, nama").in_("id", list(granted_by_ids)).execute()
         granted_by_map = {row["id"]: row["nama"] for row in users_result.data}
 
     folders = []
     for folder in folder_rows:
-        owner_name = (
-            folder.get("users", {}).get("nama", "—")
-            if folder.get("users")
-            else "—"
-        )
-
-        shared_via_user = (
-            folder["id"] in access_by_folder
-            and folder.get("user_id") != user_id
-        )
+        owner_name = folder.get("users", {}).get("nama", "—") if folder.get("users") else "—"
+        shared_via_user = folder["id"] in access_by_folder and folder.get("user_id") != user_id
         shared_via_division = bool(
-            division_id
-            and folder["id"] in div_folder_ids
+            division_id and folder["id"] in div_folder_ids
             and folder.get("division_id") != division_id
             and folder.get("user_id") != user_id
         )
         shared_to_me = shared_via_user or shared_via_division
-
         granted_by_id = access_by_folder.get(folder["id"])
         shared_by = granted_by_map.get(granted_by_id) if granted_by_id else None
         if shared_to_me and not shared_by:
@@ -1098,11 +1173,7 @@ def get_folders(user_id: str):
         item = {
             **folder,
             "owner": owner_name,
-            "div_nama": (
-                folder.get("divisions", {}).get("nama", "")
-                if folder.get("divisions")
-                else ""
-            ),
+            "div_nama": folder.get("divisions", {}).get("nama", "") if folder.get("divisions") else "",
             "shared_to_me": bool(shared_to_me),
             "shared_by": shared_by
         }
@@ -1112,8 +1183,17 @@ def get_folders(user_id: str):
 
     return {"folders": folders}
 
+
 @app.delete("/folders/{folder_id}")
-def hapus_folder(folder_id: str):
+def hapus_folder(folder_id: str, user_id: Optional[str] = None):
+    folder = _get_folder(folder_id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    if user_id:
+        _assert_folder_manageable(user_id, folder)
+    children = supabase.table("folders").select("id").eq("parent_id", folder_id).execute()
+    if children.data:
+        raise HTTPException(status_code=400, detail="Folder masih memiliki subfolder. Pindahkan atau hapus subfolder terlebih dahulu.")
     supabase.table("asset_folders").delete().eq("folder_id", folder_id).execute()
     supabase.table("folder_rules").delete().eq("folder_id", folder_id).execute()
     supabase.table("folder_access").delete().eq("folder_id", folder_id).execute()
@@ -1121,49 +1201,35 @@ def hapus_folder(folder_id: str):
     supabase.table("folders").delete().eq("id", folder_id).execute()
     return {"message": "Folder dihapus"}
 
+
 # ── Folder Access (share smart folder ke user tertentu) ──
 @app.post("/folders/{folder_id}/access")
 def set_folder_access(folder_id: str, data: FolderAccessInput):
-    folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
-    if not folder.data:
-        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
-    f = folder.data[0]
-    if not (is_manager(data.granted_by) or f.get("user_id") == data.granted_by):
-        raise HTTPException(status_code=403, detail="Tidak punya izin membagikan folder ini")
-
+    folder = _get_folder(folder_id)
+    _assert_folder_manageable(data.granted_by, folder)
     existing = supabase.table("folder_access").select("user_id").eq("folder_id", folder_id).execute()
     existing_ids = {e["user_id"] for e in existing.data}
     for uid in data.user_ids:
         if uid not in existing_ids:
             supabase.table("folder_access").insert({
-                "folder_id":   folder_id,
-                "user_id":     uid,
-                "granted_by":  data.granted_by
+                "folder_id": folder_id,
+                "user_id": uid,
+                "granted_by": data.granted_by
             }).execute()
     return {"message": "Akses folder diperbarui"}
 
+
 @app.post("/folders/{folder_id}/share")
 def share_folder_to_division(folder_id: str, data: FolderShareInput):
-    folder_result = supabase.table("folders").select("*").eq("id", folder_id).execute()
-    if not folder_result.data:
-        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
-
-    folder = folder_result.data[0]
-    if folder.get("user_id") != data.from_user_id and not is_manager(data.from_user_id):
-        raise HTTPException(status_code=403, detail="Hanya pemilik folder atau Manager yang bisa membagikan folder")
-
-    division_result = supabase.table("divisions").select("id, nama").eq(
-        "id", data.to_division_id
-    ).execute()
+    folder = _get_folder(folder_id)
+    _assert_folder_manageable(data.from_user_id, folder)
+    division_result = supabase.table("divisions").select("id, nama").eq("id", data.to_division_id).execute()
     if not division_result.data:
         raise HTTPException(status_code=404, detail="Divisi tujuan tidak ditemukan")
 
     existing_division = supabase.table("folder_divisions").select("id").eq(
         "folder_id", folder_id
-    ).eq(
-        "division_id", data.to_division_id
-    ).execute()
-
+    ).eq("division_id", data.to_division_id).execute()
     if not existing_division.data:
         supabase.table("folder_divisions").insert({
             "folder_id": folder_id,
@@ -1173,19 +1239,14 @@ def share_folder_to_division(folder_id: str, data: FolderShareInput):
     target_users = supabase.table("user_divisions").select("user_id").eq(
         "division_id", data.to_division_id
     ).execute()
-
     shared_count = 0
     for row in target_users.data:
         target_user_id = row["user_id"]
         if target_user_id == data.from_user_id:
             continue
-
         existing_access = supabase.table("folder_access").select("id").eq(
             "folder_id", folder_id
-        ).eq(
-            "user_id", target_user_id
-        ).execute()
-
+        ).eq("user_id", target_user_id).execute()
         if existing_access.data:
             supabase.table("folder_access").update({
                 "granted_by": data.from_user_id
@@ -1204,45 +1265,93 @@ def share_folder_to_division(folder_id: str, data: FolderShareInput):
         "shared_to_users": shared_count
     }
 
+
 @app.get("/folders/{folder_id}/access")
 def get_folder_access(folder_id: str):
     result = supabase.table("folder_access").select("*, users(id, nama, email)").eq("folder_id", folder_id).execute()
     users = [{**r["users"]} for r in result.data if r.get("users")]
     return {"users": users}
 
+
 @app.delete("/folders/{folder_id}/access/{user_id}")
 def hapus_folder_access(folder_id: str, user_id: str):
     supabase.table("folder_access").delete().eq("folder_id", folder_id).eq("user_id", user_id).execute()
     return {"message": "Akses dicabut"}
 
+
 @app.post("/folders/rules")
 def buat_rule(data: RuleInput):
+    keyword = (data.keyword or "").strip().lower()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="Keyword tidak boleh kosong")
+    folder = _get_folder(data.folder_id)
+    _assert_folder_manageable(data.user_id, folder)
+    existing = supabase.table("folder_rules").select("id").eq("folder_id", data.folder_id).eq("keyword", keyword).execute()
+    if existing.data:
+        return {"message": "Rule sudah ada", "rule": existing.data[0], "duplicate": True}
     result = supabase.table("folder_rules").insert({
-        "user_id":   data.user_id,
-        "keyword":   data.keyword.lower(),
+        "user_id": data.user_id,
+        "keyword": keyword,
         "folder_id": data.folder_id
     }).execute()
     return {"message": "Rule ditambahkan", "rule": result.data[0]}
 
+
+@app.post("/folders/rules/batch")
+def buat_rules_batch(data: RuleBatchInput):
+    folder = _get_folder(data.folder_id)
+    _assert_folder_manageable(data.user_id, folder)
+    keywords = []
+    seen = set()
+    for raw in data.keywords or []:
+        keyword = str(raw).strip().lower()
+        if keyword and keyword not in seen:
+            seen.add(keyword)
+            keywords.append(keyword)
+    if not keywords:
+        raise HTTPException(status_code=400, detail="Masukkan minimal satu keyword")
+
+    current = supabase.table("folder_rules").select("keyword").eq("folder_id", data.folder_id).execute()
+    existing = {str(r.get("keyword", "")).lower() for r in current.data}
+    inserted = []
+    skipped = []
+    for keyword in keywords:
+        if keyword in existing:
+            skipped.append(keyword)
+            continue
+        result = supabase.table("folder_rules").insert({
+            "user_id": data.user_id,
+            "keyword": keyword,
+            "folder_id": data.folder_id
+        }).execute()
+        inserted.append(result.data[0])
+        existing.add(keyword)
+    return {"message": f"{len(inserted)} rule ditambahkan", "rules": inserted, "skipped": skipped}
+
+
 @app.get("/folders/rules")
-def get_rules(user_id: str):
-    result = supabase.table("folder_rules").select("*, folders(nama)").execute()
+def get_rules(user_id: str, folder_id: Optional[str] = None):
+    query = supabase.table("folder_rules").select("*, folders(nama)")
+    if folder_id:
+        query = query.eq("folder_id", folder_id)
+    result = query.execute()
     return {"rules": result.data}
+
 
 @app.delete("/folders/rules/{rule_id}")
 def hapus_rule(rule_id: str):
     supabase.table("folder_rules").delete().eq("id", rule_id).execute()
     return {"message": "Rule dihapus"}
 
+
 @app.get("/folders/{folder_id}/assets")
 def get_assets_by_folder(folder_id: str, user_id: Optional[str] = None):
     if user_id:
-        folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
-        if not folder.data:
+        folder = _get_folder(folder_id)
+        if not folder:
             raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
-        if not can_access_folder(user_id, folder.data[0]):
+        if not can_access_folder(user_id, folder):
             raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
-
     result = supabase.table("asset_folders").select("asset_id, assets(*)").eq("folder_id", folder_id).execute()
     assets = [r["assets"] for r in result.data if r["assets"]]
     return {"assets": assets}
