@@ -1097,9 +1097,38 @@ def set_folder_divisions(folder_id: str, data: FolderDivisionInput):
 
 @app.get("/folders/{folder_id}/divisions")
 def get_folder_divisions_endpoint(folder_id: str):
-    result = supabase.table("folder_divisions").select("*, divisions(id, nama)").eq("folder_id", folder_id).execute()
-    divisions = [r["divisions"] for r in result.data if r.get("divisions")]
-    return {"divisions": divisions}
+    try:
+        access_result = (
+            supabase.table("folder_divisions")
+            .select("division_id")
+            .eq("folder_id", folder_id)
+            .execute()
+        )
+
+        division_ids = [
+            row["division_id"]
+            for row in (access_result.data or [])
+            if row.get("division_id")
+        ]
+
+        if not division_ids:
+            return {"divisions": []}
+
+        divisions_result = (
+            supabase.table("divisions")
+            .select("id, nama")
+            .in_("id", division_ids)
+            .execute()
+        )
+
+        return {"divisions": divisions_result.data or []}
+
+    except Exception as e:
+        print(f"GET folder divisions error folder_id={folder_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal mengambil akses divisi: {str(e)}"
+        )
 
 
 @app.get("/folders")
@@ -1268,9 +1297,59 @@ def share_folder_to_division(folder_id: str, data: FolderShareInput):
 
 @app.get("/folders/{folder_id}/access")
 def get_folder_access(folder_id: str):
-    result = supabase.table("folder_access").select("*, users(id, nama, email)").eq("folder_id", folder_id).execute()
-    users = [{**r["users"]} for r in result.data if r.get("users")]
-    return {"users": users}
+    try:
+        access_result = (
+            supabase.table("folder_access")
+            .select("user_id, granted_by")
+            .eq("folder_id", folder_id)
+            .execute()
+        )
+
+        rows = access_result.data or []
+
+        if not rows:
+            return {"users": []}
+
+        user_ids = list({
+            row["user_id"]
+            for row in rows
+            if row.get("user_id")
+        })
+
+        if not user_ids:
+            return {"users": []}
+
+        users_result = (
+            supabase.table("users")
+            .select("id, nama, email")
+            .in_("id", user_ids)
+            .execute()
+        )
+
+        users_by_id = {
+            user["id"]: user
+            for user in (users_result.data or [])
+        }
+
+        users = []
+        for row in rows:
+            user = users_by_id.get(row.get("user_id"))
+            if not user:
+                continue
+
+            users.append({
+                **user,
+                "granted_by": row.get("granted_by")
+            })
+
+        return {"users": users}
+
+    except Exception as e:
+        print(f"GET folder access error folder_id={folder_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal mengambil akses user: {str(e)}"
+        )
 
 
 @app.delete("/folders/{folder_id}/access/{user_id}")
