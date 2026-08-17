@@ -9,6 +9,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from typing import Optional
+import re
 
 load_dotenv()
 
@@ -506,22 +507,53 @@ def delete_asset(asset_id: str):
 
 @app.post("/assets/{asset_id}/tags")
 def tambah_tag(asset_id: str, data: TagInput):
-    existing_tag = supabase.table("tags").select("id").eq("nama", data.nama_tag).execute()
-    if existing_tag.data:
-        tag_id = existing_tag.data[0]["id"]
-    else:
-        result = supabase.table("tags").insert({"nama": data.nama_tag}).execute()
-        tag_id = result.data[0]["id"]
-    already = supabase.table("asset_tags").select("id").eq("asset_id", asset_id).eq("tag_id", tag_id).execute()
-    if already.data:
-        return {"message": "Tag sudah ada"}
-    supabase.table("asset_tags").insert({
-        "asset_id":   asset_id,
-        "tag_id":     tag_id,
-        "sumber":     data.sumber,
-        "created_by": data.user_id
-    }).execute()
-    return {"message": "Tag ditambahkan"}
+    # Pisah input berdasarkan koma dan/atau spasi, buang yang kosong, hilangkan duplikat.
+    raw_tokens = re.split(r"[,\s]+", data.nama_tag.strip())
+    nama_list  = []
+    seen       = set()
+    for t in raw_tokens:
+        t = t.strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            nama_list.append(t)
+
+    if not nama_list:
+        raise HTTPException(status_code=400, detail="Tag tidak boleh kosong")
+
+    added = []
+    for nama_tag in nama_list:
+        existing_tag = supabase.table("tags").select("id").eq("nama", nama_tag).execute()
+        if existing_tag.data:
+            tag_id = existing_tag.data[0]["id"]
+        else:
+            result = supabase.table("tags").insert({"nama": nama_tag}).execute()
+            tag_id = result.data[0]["id"]
+
+        already = supabase.table("asset_tags").select("id").eq("asset_id", asset_id).eq("tag_id", tag_id).execute()
+        if already.data:
+            continue
+
+        supabase.table("asset_tags").insert({
+            "asset_id":   asset_id,
+            "tag_id":     tag_id,
+            "sumber":     data.sumber,
+            "created_by": data.user_id
+        }).execute()
+        added.append(nama_tag)
+
+    # Catat sebagai satu aktivitas (bukan per-tag), supaya laporan
+    # aktivitas menampilkan "User X menambahkan N tag pada file Y".
+    if added and data.user_id:
+        supabase.table("activity_log").insert({
+            "type":     "tag_added",
+            "user_id":  data.user_id,
+            "asset_id": asset_id,
+            "detail":   {"tags": added, "count": len(added), "sumber": data.sumber}
+        }).execute()
+
+    if not added:
+        return {"message": "Semua tag sudah ada sebelumnya", "added": []}
+    return {"message": f"{len(added)} tag ditambahkan", "added": added}
 
 @app.delete("/assets/{asset_id}/tags/{nama_tag}")
 def hapus_tag(asset_id: str, nama_tag: str):
@@ -886,6 +918,10 @@ def get_activity(limit: int = 30):
         "id, catatan, created_at, assets(nama_file), users!asset_shares_from_user_id_fkey(nama), divisions(nama)"
     ).order("created_at", desc=True).limit(limit).execute()
 
+    tag_events = supabase.table("activity_log").select(
+        "id, detail, created_at, users(nama), assets(nama_file, divisions(nama))"
+    ).eq("type", "tag_added").order("created_at", desc=True).limit(limit).execute()
+
     activities = []
     for u in uploads.data:
         activities.append({
@@ -905,6 +941,18 @@ def get_activity(limit: int = 30):
             "file":       s.get("assets", {}).get("nama_file", "—") if s.get("assets") else "—",
             "catatan":    s.get("catatan", ""),
             "created_at": s["created_at"]
+        })
+    for t in tag_events.data:
+        asset  = t.get("assets") or {}
+        detail = t.get("detail") or {}
+        activities.append({
+            "type":       "tag_added",
+            "user":       t.get("users", {}).get("nama", "—") if t.get("users") else "—",
+            "division":   asset.get("divisions", {}).get("nama", "—") if asset.get("divisions") else "—",
+            "file":       asset.get("nama_file", "—"),
+            "count":      detail.get("count", 0),
+            "tags":       detail.get("tags", []),
+            "created_at": t["created_at"]
         })
     activities.sort(key=lambda x: x["created_at"], reverse=True)
     return {"activities": activities[:limit]}
