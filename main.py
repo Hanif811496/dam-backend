@@ -51,6 +51,11 @@ class FolderAccessInput(BaseModel):
     user_ids: list
     granted_by: str
 
+class MoveAssetInput(BaseModel):
+    user_id: str
+    to_folder_id: str
+    from_folder_id: Optional[str] = None
+
 class RuleInput(BaseModel):
     user_id: str
     keyword: str
@@ -569,12 +574,9 @@ def add_asset_to_folder(folder_id: str, asset_id: str, user_id: str):
     folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
     if not folder.data:
         raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
-    f           = folder.data[0]
-    ud          = get_user_division(user_id)
-    division_id = ud["division_id"] if ud else None
-    if f["type"] == "system":
-        if division_id != f.get("division_id") and division_id != MANAGER_ID:
-            raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
+    f = folder.data[0]
+    if not can_access_folder(user_id, f):
+        raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
     already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
     if not already.data:
         supabase.table("asset_folders").insert({
@@ -582,6 +584,41 @@ def add_asset_to_folder(folder_id: str, asset_id: str, user_id: str):
             "folder_id": folder_id
         }).execute()
     return {"message": "Aset ditambahkan ke folder"}
+
+@app.delete("/folders/{folder_id}/assets/{asset_id}")
+def remove_asset_from_folder(folder_id: str, asset_id: str, user_id: str):
+    folder = supabase.table("folders").select("*").eq("id", folder_id).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
+    f = folder.data[0]
+    if not can_access_folder(user_id, f):
+        raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
+    supabase.table("asset_folders").delete().eq("asset_id", asset_id).eq("folder_id", folder_id).execute()
+    return {"message": "Aset dikeluarkan dari folder"}
+
+@app.post("/assets/{asset_id}/move-folder")
+def move_asset_to_folder(asset_id: str, data: MoveAssetInput):
+    target = supabase.table("folders").select("*").eq("id", data.to_folder_id).execute()
+    if not target.data:
+        raise HTTPException(status_code=404, detail="Folder tujuan tidak ditemukan")
+    if not can_access_folder(data.user_id, target.data[0]):
+        raise HTTPException(status_code=403, detail="Tidak punya akses ke folder tujuan")
+
+    if data.from_folder_id and data.from_folder_id != data.to_folder_id:
+        source = supabase.table("folders").select("*").eq("id", data.from_folder_id).execute()
+        if source.data:
+            if not can_access_folder(data.user_id, source.data[0]):
+                raise HTTPException(status_code=403, detail="Tidak punya akses ke folder asal")
+        supabase.table("asset_folders").delete().eq("asset_id", asset_id).eq("folder_id", data.from_folder_id).execute()
+
+    already = supabase.table("asset_folders").select("id").eq("asset_id", asset_id).eq("folder_id", data.to_folder_id).execute()
+    if not already.data:
+        supabase.table("asset_folders").insert({
+            "asset_id":  asset_id,
+            "folder_id": data.to_folder_id
+        }).execute()
+
+    return {"message": "Aset dipindahkan ke folder baru"}
 
 # ── Tags ─────────────────────────────────────────────
 @app.get("/tags")
