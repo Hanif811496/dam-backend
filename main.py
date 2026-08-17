@@ -772,31 +772,73 @@ def log_download(asset_id: str, data: DownloadLogInput):
 
 @app.delete("/assets/{asset_id}")
 def delete_asset(asset_id: str, user_id: Optional[str] = None):
-    asset = supabase.table("assets").select("*, divisions(nama)").eq("id", asset_id).execute()
-    if not asset.data:
-        raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
+    try:
+        asset = supabase.table("assets").select("*, divisions(nama)").eq("id", asset_id).execute()
+        if not asset.data:
+            raise HTTPException(status_code=404, detail="Aset tidak ditemukan")
 
-    a = asset.data[0]
-    if user_id and a.get("user_id") != user_id and not is_manager(user_id):
-        raise HTTPException(status_code=403, detail="Hanya uploader atau Manager yang bisa menghapus aset ini")
+        a = asset.data[0]
 
-    url = a["url"]
-    path = url.split("/object/public/assets/")[1]
+        if user_id and a.get("user_id") != user_id and not is_manager(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Hanya uploader atau Manager yang bisa menghapus aset ini"
+            )
 
-    log_activity("delete", user_id, asset_id=None, detail={
-        "nama_file": a["nama_file"],
-        "tipe_file": a.get("tipe_file"),
-        "ukuran": a.get("ukuran"),
-        "divisi": a.get("divisions", {}).get("nama") if a.get("divisions") else None
-    })
+        # Simpan informasi penting sebagai audit log sebelum row asset dihapus.
+        log_activity("delete", user_id, asset_id=None, detail={
+            "nama_file": a.get("nama_file"),
+            "tipe_file": a.get("tipe_file"),
+            "ukuran": a.get("ukuran"),
+            "divisi": a.get("divisions", {}).get("nama") if a.get("divisions") else None
+        })
 
-    supabase.storage.from_("assets").remove([path])
-    supabase.table("asset_tags").delete().eq("asset_id", asset_id).execute()
-    supabase.table("asset_folders").delete().eq("asset_id", asset_id).execute()
-    supabase.table("asset_shares").delete().eq("asset_id", asset_id).execute()
-    supabase.table("asset_permissions").delete().eq("asset_id", asset_id).execute()
-    supabase.table("assets").delete().eq("id", asset_id).execute()
-    return {"message": "Aset berhasil dihapus"}
+        # Bersihkan semua relasi yang secara langsung menunjuk ke asset.
+        supabase.table("asset_tags").delete().eq("asset_id", asset_id).execute()
+        supabase.table("asset_folders").delete().eq("asset_id", asset_id).execute()
+        supabase.table("asset_shares").delete().eq("asset_id", asset_id).execute()
+        supabase.table("asset_permissions").delete().eq("asset_id", asset_id).execute()
+
+        # Activity log harus tetap disimpan untuk audit, tetapi foreign key
+        # ke asset yang akan dihapus perlu dilepaskan terlebih dahulu.
+        supabase.table("activity_log").update({
+            "asset_id": None
+        }).eq("asset_id", asset_id).execute()
+
+        # Setelah seluruh foreign key aman, baru hapus row asset utama.
+        supabase.table("assets").delete().eq("id", asset_id).execute()
+
+        # Hapus file storage secara best-effort. URL asset lama bisa memiliki
+        # format berbeda, jadi kegagalan storage tidak boleh membatalkan delete DB.
+        url = a.get("url") or ""
+
+        try:
+            marker = "/object/public/assets/"
+
+            if marker in url:
+                path = url.split(marker, 1)[1]
+                supabase.storage.from_("assets").remove([path])
+            else:
+                print(
+                    f"Storage path tidak dikenali asset_id={asset_id}, url={url}"
+                )
+
+        except Exception as storage_error:
+            print(
+                f"Gagal menghapus storage asset_id={asset_id}: {storage_error}"
+            )
+
+        return {"message": "Aset berhasil dihapus"}
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print(f"DELETE asset error asset_id={asset_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal menghapus aset: {str(e)}"
+        )
 
 @app.post("/assets/{asset_id}/tags")
 def tambah_tag(asset_id: str, data: TagInput):
