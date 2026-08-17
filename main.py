@@ -325,44 +325,127 @@ def get_division_system_folders(division_ids: list) -> list:
 
 def find_matching_smart_folders(tags: list, division_ids: list) -> list:
     """Smart folder (folder_rules) yang keyword-nya cocok salah satu tag,
-    dibatasi hanya ke folder shared atau folder milik salah satu division_ids
-    (supaya file staf satu divisi tidak nyasar otomatis ke folder divisi lain)."""
+    dibatasi hanya ke folder shared atau folder milik salah satu division_ids.
+
+    parent_id ikut diambil agar hasil prediksi bisa dipangkas ke folder terdalam.
+    """
     matches = []
     seen    = set()
-    rules   = supabase.table("folder_rules").select("*, folders(id, nama, type, division_id)").execute()
+    rules   = supabase.table("folder_rules").select(
+        "*, folders(id, nama, type, division_id, parent_id)"
+    ).execute()
+
     for rule in rules.data or []:
         folder = rule.get("folders")
         if not folder:
             continue
+
         in_scope = folder.get("type") == "shared" or folder.get("division_id") in division_ids
         if not in_scope:
             continue
+
         keyword     = (rule.get("keyword") or "").lower()
         matched_tag = next((t for t in tags if keyword in t.lower()), None)
         if not matched_tag:
             continue
+
         fid = folder["id"]
         if fid in seen:
             continue
+
         seen.add(fid)
         matches.append({
-            "id":     fid,
-            "nama":   folder["nama"],
-            "type":   folder.get("type"),
-            "reason": f'Cocok kata kunci "{matched_tag}"'
+            "id":          fid,
+            "nama":        folder["nama"],
+            "type":        folder.get("type"),
+            "division_id": folder.get("division_id"),
+            "parent_id":   folder.get("parent_id"),
+            "reason":      f'Cocok kata kunci "{matched_tag}"'
         })
+
     return matches
 
+
+def _folder_ancestor_ids(folder_id: str) -> set:
+    """Ambil seluruh ancestor sebuah folder berdasarkan parent_id."""
+    ancestors = set()
+    current = _get_folder(folder_id)
+    seen = set()
+
+    while current and current.get("parent_id"):
+        parent_id = current.get("parent_id")
+
+        if parent_id in seen:
+            break
+
+        seen.add(parent_id)
+        ancestors.add(parent_id)
+        current = _get_folder(parent_id)
+
+    return ancestors
+
+
+def _keep_deepest_folder_suggestions(system_folders: list, smart_folders: list) -> list:
+    """Hindari satu aset masuk ke parent dan child sekaligus.
+
+    Aturan:
+    - Jika ada Smart Folder yang cocok di suatu divisi, system folder divisi itu
+      tidak ikut dimasukkan ke asset_folders. division_id pada asset sudah cukup
+      untuk menunjukkan bahwa asset tersebut milik divisi itu.
+    - Jika parent Smart Folder dan child Smart Folder sama-sama cocok, hanya child
+      yang dipertahankan.
+    - Smart Folder sibling yang sama-sama cocok tetap boleh dipertahankan.
+    """
+    if not smart_folders:
+        return system_folders
+
+    matched_smart_ids = {f["id"] for f in smart_folders}
+    ancestor_ids_of_matches = set()
+
+    for folder in smart_folders:
+        ancestor_ids_of_matches.update(_folder_ancestor_ids(folder["id"]))
+
+    deepest_smart = [
+        folder
+        for folder in smart_folders
+        if folder["id"] not in ancestor_ids_of_matches
+    ]
+
+    smart_division_ids = {
+        folder.get("division_id")
+        for folder in deepest_smart
+        if folder.get("division_id")
+    }
+
+    kept_system = [
+        folder
+        for folder in system_folders
+        if folder.get("division_id") not in smart_division_ids
+    ]
+
+    return kept_system + deepest_smart
+
+
 def predict_folders(tags: list, division_ids: list) -> list:
-    """Hitung daftar folder yang relevan untuk aset ini berdasarkan auto-tagging,
-    tanpa langsung menyimpan apa pun (murni prediksi/preview)."""
-    suggestions = get_division_system_folders(division_ids)
-    seen        = {s["id"] for s in suggestions}
-    for m in find_matching_smart_folders(tags, division_ids):
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            suggestions.append(m)
-    return suggestions
+    """Hitung folder tujuan auto-assign.
+
+    Hasil sudah hierarchy-aware: bila aset cocok ke Smart Folder child, aset tidak
+    sekaligus ditempelkan ke Folder Divisi atau parent Smart Folder-nya.
+    """
+    system_folders = get_division_system_folders(division_ids)
+    smart_folders  = find_matching_smart_folders(tags, division_ids)
+
+    # Folder system lama dari helper belum membawa division_id ke output.
+    # Lengkapi supaya pruning berdasarkan divisi bisa dilakukan.
+    if system_folders:
+        system_rows = supabase.table("folders").select(
+            "id, division_id"
+        ).in_("id", [f["id"] for f in system_folders]).execute()
+        division_map = {row["id"]: row.get("division_id") for row in (system_rows.data or [])}
+        for folder in system_folders:
+            folder["division_id"] = division_map.get(folder["id"])
+
+    return _keep_deepest_folder_suggestions(system_folders, smart_folders)
 
 def commit_folder_assignments(asset_id: str, folder_ids: list):
     """Terapkan daftar folder_id ke asset_folders (idempoten, aman dipanggil ulang)."""
@@ -1431,8 +1514,45 @@ def get_assets_by_folder(folder_id: str, user_id: Optional[str] = None):
             raise HTTPException(status_code=404, detail="Folder tidak ditemukan")
         if not can_access_folder(user_id, folder):
             raise HTTPException(status_code=403, detail="Tidak punya akses ke folder ini")
-    result = supabase.table("asset_folders").select("asset_id, assets(*)").eq("folder_id", folder_id).execute()
-    assets = [r["assets"] for r in result.data if r["assets"]]
+
+    result = supabase.table("asset_folders").select(
+        "asset_id, assets(*)"
+    ).eq("folder_id", folder_id).execute()
+
+    raw_assets = [
+        row["assets"]
+        for row in (result.data or [])
+        if row.get("assets")
+    ]
+
+    if not raw_assets:
+        return {"assets": []}
+
+    uploader_ids = list({
+        asset.get("user_id")
+        for asset in raw_assets
+        if asset.get("user_id")
+    })
+
+    uploader_map = {}
+    if uploader_ids:
+        users_result = supabase.table("users").select(
+            "id, nama"
+        ).in_("id", uploader_ids).execute()
+
+        uploader_map = {
+            row["id"]: row.get("nama", "—")
+            for row in (users_result.data or [])
+        }
+
+    assets = []
+    for asset in raw_assets:
+        item = {
+            **asset,
+            "uploader": uploader_map.get(asset.get("user_id"), "—")
+        }
+        assets.append(item)
+
     return {"assets": assets}
 
 # ── Divisions ────────────────────────────────────────
