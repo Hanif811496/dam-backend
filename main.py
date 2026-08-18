@@ -347,10 +347,19 @@ def get_division_system_folders(division_ids: list) -> list:
     } for f in result.data]
 
 def _matching_smart_folders_from_rules(tags: list, division_ids: list, rules: list) -> list:
-    """Hitung Smart Folder yang cocok dari rules yang sudah diambil dari database."""
-    normalized_tags = [str(tag or "").strip().lower() for tag in (tags or []) if str(tag or "").strip()]
-    matches = []
-    seen = set()
+    """Hitung Smart Folder yang cocok sekaligus kekuatan kecocokannya.
+
+    Satu folder bisa memiliki banyak rule. Semua rule yang cocok dikumpulkan agar
+    rekomendasi dapat diranking berdasarkan jumlah rule/tag yang cocok, bukan
+    berdasarkan urutan row folder_rules di database.
+    """
+    normalized_tags = list(dict.fromkeys([
+        str(tag or "").strip().lower()
+        for tag in (tags or [])
+        if str(tag or "").strip()
+    ]))
+
+    folder_stats = {}
 
     for rule in rules or []:
         folder = rule.get("folders")
@@ -365,22 +374,54 @@ def _matching_smart_folders_from_rules(tags: list, division_ids: list, rules: li
         if not keyword:
             continue
 
-        matched_tag = next((tag for tag in normalized_tags if keyword in tag), None)
-        if not matched_tag:
-            continue
-
         fid = folder["id"]
-        if fid in seen:
+        stat = folder_stats.setdefault(fid, {
+            "folder": folder,
+            "rule_keywords": set(),
+            "matched_keywords": set(),
+            "matched_tags": set(),
+        })
+
+        stat["rule_keywords"].add(keyword)
+
+        matched_tag = next((tag for tag in normalized_tags if keyword in tag), None)
+        if matched_tag:
+            stat["matched_keywords"].add(keyword)
+            stat["matched_tags"].add(matched_tag)
+
+    matches = []
+
+    for stat in folder_stats.values():
+        if not stat["matched_keywords"]:
             continue
 
-        seen.add(fid)
+        folder = stat["folder"]
+        matched_tags = [tag for tag in normalized_tags if tag in stat["matched_tags"]]
+        matched_keywords = sorted(stat["matched_keywords"])
+        rule_count = len(stat["rule_keywords"])
+        match_count = len(stat["matched_keywords"])
+        match_ratio = (match_count / rule_count) if rule_count else 0
+
+        if match_ratio >= 1:
+            confidence = "Sangat cocok"
+        elif match_ratio >= 0.5:
+            confidence = "Cocok"
+        else:
+            confidence = "Kecocokan rendah"
+
         matches.append({
-            "id": fid,
+            "id": folder["id"],
             "nama": folder["nama"],
             "type": folder.get("type"),
             "division_id": folder.get("division_id"),
             "parent_id": folder.get("parent_id"),
-            "reason": f'Cocok kata kunci "{matched_tag}"'
+            "matched_tags": matched_tags,
+            "matched_keywords": matched_keywords,
+            "match_count": match_count,
+            "rule_count": rule_count,
+            "match_ratio": round(match_ratio, 4),
+            "confidence": confidence,
+            "reason": f'{match_count}/{rule_count} tag cocok · {", ".join(matched_tags)}'
         })
 
     return matches
@@ -458,11 +499,56 @@ def _keep_deepest_folder_suggestions(system_folders: list, smart_folders: list) 
     return kept_system + deepest_smart
 
 
-def predict_folders(tags: list, division_ids: list) -> list:
-    """Hitung folder tujuan auto-assign.
+def _folder_depth(folder_id: str) -> int:
+    """Kedalaman folder untuk tie-break ranking rekomendasi."""
+    return len(_folder_ancestor_ids(folder_id))
 
-    Hasil sudah hierarchy-aware: bila aset cocok ke Smart Folder child, aset tidak
-    sekaligus ditempelkan ke Folder Divisi atau parent Smart Folder-nya.
+
+def _rank_folder_suggestions(suggestions: list, auto_select_limit: int = 3) -> list:
+    """Urutkan rekomendasi dari yang paling relevan dan tandai top-N default.
+
+    Prioritas ranking:
+    1. jumlah rule/tag yang cocok;
+    2. persentase rule folder yang cocok;
+    3. folder yang lebih dalam/spesifik;
+    4. nama folder A-Z sebagai tie-breaker stabil.
+    """
+    enriched = []
+
+    for suggestion in suggestions or []:
+        item = dict(suggestion)
+        if item.get("type") == "smart":
+            item["depth"] = _folder_depth(item["id"])
+        else:
+            item.setdefault("match_count", 0)
+            item.setdefault("rule_count", 0)
+            item.setdefault("match_ratio", 0)
+            item.setdefault("matched_tags", [])
+            item.setdefault("matched_keywords", [])
+            item.setdefault("confidence", "Folder divisi")
+            item["depth"] = 0
+        enriched.append(item)
+
+    enriched.sort(key=lambda item: (
+        -int(item.get("match_count") or 0),
+        -float(item.get("match_ratio") or 0),
+        -int(item.get("depth") or 0),
+        str(item.get("nama") or "").lower(),
+    ))
+
+    for index, item in enumerate(enriched, start=1):
+        item["rank"] = index
+        item["auto_selected"] = index <= auto_select_limit
+
+    return enriched
+
+
+def predict_folders(tags: list, division_ids: list) -> list:
+    """Hitung dan ranking folder tujuan auto-assign.
+
+    Hasil hierarchy-aware: bila parent dan child sama-sama cocok, parent dibuang.
+    Sibling yang cocok tetap dipertahankan, lalu diurutkan berdasarkan kekuatan
+    kecocokan. Maksimal 3 rekomendasi teratas ditandai sebagai default.
     """
     system_folders = get_division_system_folders(division_ids)
     smart_folders  = find_matching_smart_folders(tags, division_ids)
@@ -477,7 +563,8 @@ def predict_folders(tags: list, division_ids: list) -> list:
         for folder in system_folders:
             folder["division_id"] = division_map.get(folder["id"])
 
-    return _keep_deepest_folder_suggestions(system_folders, smart_folders)
+    hierarchy_filtered = _keep_deepest_folder_suggestions(system_folders, smart_folders)
+    return _rank_folder_suggestions(hierarchy_filtered, auto_select_limit=3)
 
 def _system_folder_ids_for_division(division_id: str) -> set:
     if not division_id:
@@ -543,12 +630,13 @@ def commit_folder_assignments(asset_id: str, folder_ids: list, prune_ancestors: 
 
 
 def auto_assign_folder(asset_id: str, tags: list, division_id: str = None) -> list:
-    """Prediksi folder tujuan dari tag dan langsung terapkan sebagai default."""
+    """Prediksi folder tujuan dan terapkan maksimal 3 rekomendasi terbaik."""
     division_ids = [division_id] if division_id else []
     suggestions = predict_folders(tags, division_ids)
+    selected = [suggestion for suggestion in suggestions if suggestion.get("auto_selected")]
     commit_folder_assignments(
         asset_id,
-        [suggestion["id"] for suggestion in suggestions],
+        [suggestion["id"] for suggestion in selected],
         prune_ancestors=True
     )
     return suggestions
@@ -571,9 +659,10 @@ def auto_assign_asset_from_current_tags(asset_id: str) -> list:
 
     tags = get_asset_tag_names(asset_id)
     suggestions = predict_folders(tags, [division_id])
+    selected = [suggestion for suggestion in suggestions if suggestion.get("auto_selected")]
     added_ids = set(commit_folder_assignments(
         asset_id,
-        [suggestion["id"] for suggestion in suggestions],
+        [suggestion["id"] for suggestion in selected],
         prune_ancestors=True
     ))
 
