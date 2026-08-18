@@ -10,6 +10,7 @@ from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from typing import Optional
 import re
+import mimetypes
 
 load_dotenv()
 
@@ -206,8 +207,11 @@ def tag_dari_nama_file(nama_file: str) -> list:
     tokens = nama.replace("-", "_").replace(" ", "_").split("_")
     return [t.lower() for t in tokens if t and t.lower() not in stopwords and len(t) > 1]
 
-def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
+def tag_dari_tipe_file(tipe: str, ukuran: int, nama_file: str = "") -> list:
     tags = []
+    tipe = (tipe or "").lower()
+    ekstensi = os.path.splitext(nama_file or "")[1].lower()
+
     if "image" in tipe:
         tags.append("gambar")
         if "jpeg" in tipe or "jpg" in tipe: tags.append("jpg")
@@ -216,8 +220,14 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
         elif "webp" in tipe: tags.append("webp")
     elif "video" in tipe:
         tags.append("video")
-        if "mp4" in tipe:         tags.append("mp4")
-        elif "quicktime" in tipe: tags.append("mov")
+        if "mp4" in tipe or ekstensi == ".mp4":         tags.append("mp4")
+        elif "quicktime" in tipe or ekstensi == ".mov": tags.append("mov")
+    elif "audio" in tipe or ekstensi in {".mp3", ".wav"}:
+        tags.append("audio")
+        if ekstensi == ".mp3" or "mpeg" in tipe or "mp3" in tipe:
+            tags.append("mp3")
+        elif ekstensi == ".wav" or "wav" in tipe:
+            tags.append("wav")
     elif "pdf" in tipe:
         tags.append("pdf")
         tags.append("dokumen")
@@ -227,6 +237,7 @@ def tag_dari_tipe_file(tipe: str, ukuran: int) -> list:
     elif "spreadsheet" in tipe or "excel" in tipe:
         tags.append("excel")
         tags.append("spreadsheet")
+
     mb = ukuran / (1024 * 1024)
     if mb < 1:    tags.append("file-kecil")
     elif mb < 10: tags.append("file-sedang")
@@ -728,7 +739,17 @@ async def upload_asset(
 ):
     isi_file = await file.read()
     ukuran   = len(isi_file)
-    ekstensi = os.path.splitext(file.filename)[1]
+    ekstensi = os.path.splitext(file.filename or "")[1].lower()
+
+
+    # MIME type adalah identitas teknis file. MP3 secara standar menggunakan
+    # audio/mpeg; ekstensi asli tetap disimpan di nama_file dan path storage.
+    tipe_file = (file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream").lower()
+    if ekstensi == ".mp3":
+        tipe_file = "audio/mpeg"
+    elif ekstensi == ".wav":
+        tipe_file = "audio/wav"
+
     nama_unik    = f"{uuid.uuid4()}{ekstensi}"
     path_storage = f"{user_id}/{nama_unik}"
 
@@ -736,7 +757,7 @@ async def upload_asset(
         supabase.storage.from_("assets").upload(
             path=path_storage,
             file=isi_file,
-            file_options={"content-type": file.content_type}
+            file_options={"content-type": tipe_file}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal upload ke storage: {str(e)}")
@@ -759,7 +780,7 @@ async def upload_asset(
         "user_id":     user_id,
         "division_id": division_id,
         "nama_file":   file.filename,
-        "tipe_file":   file.content_type,
+        "tipe_file":   tipe_file,
         "ukuran":      ukuran,
         "url":         url_publik,
         # Aset tidak lagi otomatis menjadi global/public antar-divisi.
@@ -779,11 +800,11 @@ async def upload_asset(
     tags_nama = tag_dari_nama_file(file.filename)
     simpan_tags(asset_id, tags_nama, "nama_file")
 
-    tags_tipe = tag_dari_tipe_file(file.content_type, ukuran)
+    tags_tipe = tag_dari_tipe_file(tipe_file, ukuran, file.filename)
     simpan_tags(asset_id, tags_tipe, "metadata")
 
     tags_ai = []
-    if "image" in file.content_type:
+    if "image" in tipe_file:
         tags_ai = tag_dari_imagga(url_publik)
         simpan_tags(asset_id, tags_ai, "ai")
 
